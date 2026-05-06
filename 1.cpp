@@ -7,9 +7,21 @@ constexpr int B_SIZE = 11;
 constexpr int CELL_COUNT = B_SIZE * B_SIZE;
 constexpr double EXPLORE_RATE = 0.40;
 constexpr double PRIOR_WEIGHT = 2.8;
+constexpr double TIME_LIMIT_SEC = 0.90;
 constexpr int POOL_CAPACITY = 600005;
 
-static mt19937 rand_gen(static_cast<unsigned>(chrono::steady_clock::now().time_since_epoch().count()));
+unsigned init_seed() {
+    if (const char* env_seed = getenv("HEX_SEED")) {
+        char* end_ptr = nullptr;
+        unsigned long parsed = strtoul(env_seed, &end_ptr, 10);
+        if (end_ptr != env_seed && *end_ptr == '\0') {
+            return static_cast<unsigned>(parsed);
+        }
+    }
+    return static_cast<unsigned>(chrono::steady_clock::now().time_since_epoch().count());
+}
+
+static mt19937 rand_gen(init_seed());
 
 const int DIR_R[6] = {0, 1, 1, 0, -1, -1};
 const int DIR_C[6] = {1, 0, -1, -1, 0, 1};
@@ -127,18 +139,22 @@ double eval_position_id(int id, const HexBoard& b, int self_color) {
     return base_val;
 }
 
+inline double normalized_prior(double raw_score) {
+    return clamp((raw_score + 50.0) / 250.0, 0.0, 1.0);
+}
+
 struct TreeNode {
     int8_t r_idx, c_idx, player_color;
     int visit_count;
     double win_score, prior_val;
     int p_node, head_child, right_bro;
-    int8_t pend_r[CELL_COUNT], pend_c[CELL_COUNT];
+    uint8_t pend_id[CELL_COUNT];
     int pend_size;
 };
 
 struct Action {
     double score;
-    int8_t r, c;
+    uint8_t id;
 
     bool operator<(const Action& other) const {
         return score < other.score;
@@ -187,8 +203,7 @@ int spawn_node(int move_r, int move_c, int move_col, int parent, const HexBoard&
         if (!has_piece || near_piece[id]) {
             actions[action_count++] = {
                 eval_position_id(id, b, root_color),
-                static_cast<int8_t>(id / B_SIZE),
-                static_cast<int8_t>(id % B_SIZE)
+                static_cast<uint8_t>(id)
             };
         }
     }
@@ -198,8 +213,7 @@ int spawn_node(int move_r, int move_c, int move_col, int parent, const HexBoard&
             if (b.empty(id)) {
                 actions[action_count++] = {
                     eval_position_id(id, b, root_color),
-                    static_cast<int8_t>(id / B_SIZE),
-                    static_cast<int8_t>(id % B_SIZE)
+                    static_cast<uint8_t>(id)
                 };
             }
         }
@@ -207,12 +221,11 @@ int spawn_node(int move_r, int move_c, int move_col, int parent, const HexBoard&
 
     sort(actions, actions + action_count);
     for (int i = 0; i < action_count; ++i) {
-        nd.pend_r[nd.pend_size] = actions[i].r;
-        nd.pend_c[nd.pend_size] = actions[i].c;
+        nd.pend_id[nd.pend_size] = actions[i].id;
         ++nd.pend_size;
     }
 
-    nd.prior_val = (move_r == -1) ? 0.0 : eval_position_id(cell_id(move_r, move_c), b, root_color);
+    nd.prior_val = (move_r == -1) ? 0.0 : normalized_prior(eval_position_id(cell_id(move_r, move_c), b, root_color));
     return cur_id;
 }
 
@@ -314,7 +327,7 @@ pair<int, int> execute_mcts(HexBoard& base_state, int my_side) {
     int root_idx = spawn_node(-1, -1, -my_side, 0, base_state, my_side);
     auto started_at = chrono::steady_clock::now();
 
-    while (chrono::duration<double>(chrono::steady_clock::now() - started_at).count() < 0.90 &&
+    while (chrono::duration<double>(chrono::steady_clock::now() - started_at).count() < TIME_LIMIT_SEC &&
            total_nodes < POOL_CAPACITY - 150) {
         int track_node = root_idx, active_side = my_side;
         HexBoard sim_board = base_state;
@@ -343,9 +356,9 @@ pair<int, int> execute_mcts(HexBoard& base_state, int my_side) {
 
         if (tree_nodes[track_node].pend_size > 0) {
             --tree_nodes[track_node].pend_size;
-            int nr = tree_nodes[track_node].pend_r[tree_nodes[track_node].pend_size];
-            int nc = tree_nodes[track_node].pend_c[tree_nodes[track_node].pend_size];
-            sim_board.put_piece(nr, nc, active_side);
+            int next_id = tree_nodes[track_node].pend_id[tree_nodes[track_node].pend_size];
+            int nr = next_id / B_SIZE, nc = next_id % B_SIZE;
+            sim_board.put_piece_id(next_id, active_side);
 
             int new_ch = spawn_node(nr, nc, active_side, track_node, sim_board, my_side);
             tree_nodes[new_ch].right_bro = tree_nodes[track_node].head_child;

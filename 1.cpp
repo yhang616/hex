@@ -29,11 +29,41 @@ constexpr int kBottom = 122;
 constexpr int kLeft = 123;
 constexpr int kRight = 124;
 constexpr int kDsuSize = 125;
-constexpr double kTimeLimitSeconds = 0.88;
+constexpr double kTimeLimitSeconds = 0.22;
 constexpr double kExplore = 0.55;
 constexpr int kRolloutRandomPercent = 7;
-constexpr int kNodeReserve = 180000;
+constexpr int kNodeReserve = 70000;
 constexpr int kInf = 1000000000;
+constexpr int kStaticDepth = 2;
+constexpr int kStaticBranchLimit = 14;
+
+constexpr array<int, kCellCount> kAnchoredThirdMoveBook = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,80,40,45,80,48,50,45,-1,
+    -1,35,73,34,40,40,73,73,45,-1,-1,
+    -1,73,80,80,50,80,61,73,80,45,45,
+    -1,80,80,45,45,50,42,80,80,50,58,
+    40,70,45,59,45,80,80,80,80,72,80,
+    84,85,51,45,45,70,80,80,80,51,80,
+    59,80,80,51,45,80,70,70,80,72,60,
+    50,59,45,69,80,80,80,70,70,80,72,
+    42,71,100,80,80,70,96,70,70,80,40,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+constexpr array<int, kCellCount> kAnchoredFourthMoveBook = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    40,40,-1,40,40,40,28,40,95,51,62,
+    71,40,40,40,71,40,96,47,83,62,95,
+    95,36,95,95,95,50,95,83,83,40,20,
+    40,71,71,71,71,71,71,62,29,40,40,
+    92,95,40,71,71,71,40,40,40,96,96,
+    40,40,59,71,81,40,40,84,40,96,40,
+    40,93,90,-1,70,71,50,50,40,107,40,
+    47,40,79,71,71,40,40,84,50,50,40,
+    40,40,40,40,40,50,50,40,40,40,40,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
 
 const int kDr[6] = {-1, -1, 0, 0, 1, 1};
 const int kDc[6] = {0, 1, -1, 1, -1, 0};
@@ -258,6 +288,41 @@ double static_move_score(const Board& board, int id, int color) {
     return score;
 }
 
+
+int stone_count(const Board& board) {
+    int count = 0;
+    for (int id = 0; id < kCellCount; ++id) count += board.stone[id] != 0;
+    return count;
+}
+
+int opening_book_move(const Board& board) {
+    const int occupied = stone_count(board);
+    auto legal_book_move = [&](int id) {
+        return 0 <= id && id < kCellCount && board.empty(id) ? id : -1;
+    };
+
+    if (occupied == 1) return legal_book_move(cell_id(7, 3));
+
+    const int swap_anchor = cell_id(1, 2);
+    const int reply_anchor = cell_id(7, 3);
+    if ((occupied == 2 && board.stone[swap_anchor] != 0) ||
+        (occupied == 3 && board.stone[swap_anchor] != 0 && board.stone[reply_anchor] != 0)) {
+        int pattern_id = -1;
+        for (int id = 0; id < kCellCount; ++id) {
+            if (board.stone[id] == 0) continue;
+            if (id == swap_anchor) continue;
+            if (occupied == 3 && id == reply_anchor) continue;
+            pattern_id = id;
+        }
+        if (pattern_id != -1) {
+            const int action = occupied == 2 ? kAnchoredThirdMoveBook[pattern_id] : kAnchoredFourthMoveBook[pattern_id];
+            return legal_book_move(action);
+        }
+    }
+
+    return -1;
+}
+
 int immediate_win(const Board& board, const vector<int>& empties, int color) {
     for (int id : empties) {
         Board trial = board;
@@ -421,6 +486,108 @@ vector<int> candidate_moves(const Board& board, int color) {
     return result;
 }
 
+double position_score(const Board& board, int perspective) {
+    Board terminal_check = board;
+    if (terminal_check.red_won()) return perspective == 1 ? 1e6 : -1e6;
+    if (terminal_check.blue_won()) return perspective == -1 ? 1e6 : -1e6;
+
+    const PathInfo own_path = evaluate_paths(board, perspective);
+    const PathInfo opp_path = evaluate_paths(board, -perspective);
+    int own_mobility = 0;
+    int opp_mobility = 0;
+    double local_shape = 0.0;
+
+    for (int id = 0; id < kCellCount; ++id) {
+        if (!board.empty(id)) continue;
+        if (span_after_move(own_path, id) == own_path.best) ++own_mobility;
+        if (span_after_move(opp_path, id) == opp_path.best) ++opp_mobility;
+        local_shape += 0.010 * static_move_score(board, id, perspective);
+        local_shape -= 0.008 * static_move_score(board, id, -perspective);
+    }
+
+    return 120.0 * (opp_path.best - own_path.best) + 3.5 * (own_mobility - opp_mobility) + local_shape;
+}
+
+vector<int> ordered_static_moves(const Board& board, int color, int limit) {
+    vector<int> empties = legal_moves(board);
+    const int win = immediate_win(board, empties, color);
+    if (win != -1) return {win};
+    const int block = immediate_win(board, empties, -color);
+    if (block != -1) return {block};
+
+    const PathInfo own_path = evaluate_paths(board, color);
+    const PathInfo opp_path = evaluate_paths(board, -color);
+    vector<pair<double, int>> scored;
+    scored.reserve(empties.size());
+    for (int id : empties) {
+        const int own_span = span_after_move(own_path, id);
+        const int opp_span = span_after_move(opp_path, id);
+        double score = static_move_score(board, id, color) + 0.80 * static_move_score(board, id, -color);
+        if (own_span < kInf) score += 120.0 / (1.0 + own_span);
+        if (opp_span < kInf) score += 110.0 / (1.0 + opp_span);
+        if (own_span == own_path.best) score += 95.0;
+        if (opp_span == opp_path.best) score += 90.0;
+        scored.push_back({score, id});
+    }
+    sort(scored.begin(), scored.end(), greater<pair<double, int>>());
+
+    vector<int> result;
+    const int keep = min(limit, static_cast<int>(scored.size()));
+    result.reserve(keep);
+    for (int i = 0; i < keep; ++i) result.push_back(scored[i].second);
+    return result;
+}
+
+double static_minimax(const Board& board, int color, int perspective, int depth, double alpha, double beta) {
+    Board terminal_check = board;
+    if (depth == 0 || terminal_check.finished()) return position_score(board, perspective);
+
+    const vector<int> moves = ordered_static_moves(board, color, kStaticBranchLimit);
+    if (moves.empty()) return position_score(board, perspective);
+
+    if (color == perspective) {
+        double best = -1e100;
+        for (int id : moves) {
+            Board child = board;
+            const bool won = child.play_id(id, color);
+            const double value = won ? 1e6 : static_minimax(child, -color, perspective, depth - 1, alpha, beta);
+            best = max(best, value);
+            alpha = max(alpha, best);
+            if (alpha >= beta) break;
+        }
+        return best;
+    }
+
+    double best = 1e100;
+    for (int id : moves) {
+        Board child = board;
+        const bool won = child.play_id(id, color);
+        const double value = won ? -1e6 : static_minimax(child, -color, perspective, depth - 1, alpha, beta);
+        best = min(best, value);
+        beta = min(beta, best);
+        if (alpha >= beta) break;
+    }
+    return best;
+}
+
+int static_search_move(const Board& board) {
+    const vector<int> moves = ordered_static_moves(board, board.turn, kStaticBranchLimit);
+    if (moves.empty()) return -1;
+
+    int best_move = moves.front();
+    double best_score = -1e100;
+    for (int id : moves) {
+        Board child = board;
+        const bool won = child.play_id(id, board.turn);
+        const double score = won ? 1e6 : static_minimax(child, -board.turn, board.turn, kStaticDepth - 1, -1e100, 1e100);
+        if (score > best_score) {
+            best_score = score;
+            best_move = id;
+        }
+    }
+    return best_move;
+}
+
 int make_node(int move, int player, int parent, const Board& board, int next_color) {
     Node node;
     node.move = move;
@@ -456,6 +623,9 @@ pair<int, int> search(Board root_board) {
     if (move != -1) return {row_of(move), col_of(move)};
     move = immediate_win(root_board, root_legal, -root_board.turn);
     if (move != -1) return {row_of(move), col_of(move)};
+
+    const int static_fallback = static_search_move(root_board);
+    if (!time_left() && static_fallback != -1) return {row_of(static_fallback), col_of(static_fallback)};
 
     root_color = root_board.turn;
     tree.clear();
@@ -517,6 +687,7 @@ pair<int, int> search(Board root_board) {
     }
 
     if (best_child != -1) return {row_of(tree[best_child].move), col_of(tree[best_child].move)};
+    if (static_fallback != -1) return {row_of(static_fallback), col_of(static_fallback)};
     if (!root_legal.empty()) return {row_of(root_legal.front()), col_of(root_legal.front())};
     return {0, 0};
 }
@@ -570,7 +741,14 @@ int main() {
         forced_start = input_json["requests"][0].isMember("forced_x");
     }
 
-    pair<int, int> decision = forced_start ? make_pair(1, 2) : search(board);
+    pair<int, int> decision;
+    if (forced_start) {
+        decision = make_pair(1, 2);
+    } else if (const int book_move = opening_book_move(board); book_move != -1) {
+        decision = make_pair(row_of(book_move), col_of(book_move));
+    } else {
+        decision = search(board);
+    }
 
     Json::Value result;
     result["response"] = make_response(decision.first, decision.second);

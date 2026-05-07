@@ -1,428 +1,420 @@
 #pragma GCC optimize("O3,unroll-loops")
 #include <bits/stdc++.h>
+#include "jsoncpp/json.h"
 
 using namespace std;
+namespace {
 
-constexpr int B_SIZE = 11;
-constexpr int CELL_COUNT = B_SIZE * B_SIZE;
-constexpr double EXPLORE_RATE = 0.40;
-constexpr double PRIOR_WEIGHT = 2.8;
-constexpr double TIME_LIMIT_SEC = 0.90;
-constexpr int POOL_CAPACITY = 600005;
+constexpr int kSide = 11;
+constexpr int kCells = kSide * kSide;
+constexpr int kTop = 121;
+constexpr int kBottom = 122;
+constexpr int kLeft = 123;
+constexpr int kRight = 124;
+constexpr int kMaxDsu = 125;
+constexpr int kNodeLimit = 10000005;
+constexpr double kThinkSeconds = 0.90;
+constexpr double kExplore = 0.40;
 
-unsigned init_seed() {
-    if (const char* env_seed = getenv("HEX_SEED")) {
-        char* end_ptr = nullptr;
-        unsigned long parsed = strtoul(env_seed, &end_ptr, 10);
-        if (end_ptr != env_seed && *end_ptr == '\0') {
-            return static_cast<unsigned>(parsed);
-        }
-    }
-    return static_cast<unsigned>(chrono::steady_clock::now().time_since_epoch().count());
+mt19937 rng(1);
+
+inline int to_id(int row, int col) { return row * kSide + col; }
+inline int row_of(int id) { return id / kSide; }
+inline int col_of(int id) { return id % kSide; }
+inline bool inside(int row, int col) {
+    return 0 <= row && row < kSide && 0 <= col && col < kSide;
 }
 
-static mt19937 rand_gen(init_seed());
+const int kDr[6] = {-1, -1, 0, 0, 1, 1};
+const int kDc[6] = {0, 1, -1, 1, -1, 0};
 
-const int DIR_R[6] = {0, 1, 1, 0, -1, -1};
-const int DIR_C[6] = {1, 0, -1, -1, 0, 1};
-const int BRG_R[6] = {-1, 1, 2, 1, -1, -2};
-const int BRG_C[6] = {2, 1, -1, -2, -1, 1};
+vector<pair<int, int>> cells;
+int generated_nodes = 1;
+int search_radius = 2;
+clock_t started_at;
 
-inline bool in_board(int r, int c) {
-    return static_cast<unsigned>(r) < B_SIZE && static_cast<unsigned>(c) < B_SIZE;
-}
+class Position {
+public:
+    array<array<int8_t, kSide>, kSide> stone{};
+    array<int, kMaxDsu> parent{};
+    int turn = 1;
 
-inline int cell_id(int r, int c) {
-    return r * B_SIZE + c;
-}
+    Position() { reset(); }
 
-struct DisjointSet {
-    int parent_node[CELL_COUNT], set_size[CELL_COUNT], edge_mask[CELL_COUNT];
+    void reset() {
+        for (auto& row : stone) row.fill(0);
+        iota(parent.begin(), parent.end(), 0);
+        turn = 1;
+    }
 
-    inline void clear_all() {
-        for (int i = 0; i < CELL_COUNT; ++i) {
-            parent_node[i] = i;
-            set_size[i] = 1;
-            edge_mask[i] = 0;
+    int root(int x) {
+        if (parent[x] == x) return x;
+        return parent[x] = root(parent[x]);
+    }
+
+    int color(int row, int col) const { return stone[row][col]; }
+
+    void link(int a, int b) { parent[root(a)] = root(b); }
+
+    void play(int row, int col) {
+        assert(inside(row, col));
+        assert(stone[row][col] == 0);
+
+        stone[row][col] = static_cast<int8_t>(turn);
+        const int here = to_id(row, col);
+        for (int dir = 0; dir < 6; ++dir) {
+            const int nr = row + kDr[dir];
+            const int nc = col + kDc[dir];
+            if (inside(nr, nc)) {
+                if (stone[nr][nc] == turn) link(here, to_id(nr, nc));
+            } else if (turn == 1) {
+                if (nr == -1) link(here, kTop);
+                if (nr == kSide) link(here, kBottom);
+            } else {
+                if (nc == -1) link(here, kLeft);
+                if (nc == kSide) link(here, kRight);
+            }
         }
+        turn = -turn;
     }
 
-    inline int find_root(int curr) {
-        int root = curr;
-        while (parent_node[root] != root) root = parent_node[root];
-        while (parent_node[curr] != root) {
-            int tmp = parent_node[curr];
-            parent_node[curr] = root;
-            curr = tmp;
-        }
-        return root;
-    }
+    bool red_won() { return root(kTop) == root(kBottom); }
+    bool blue_won() { return root(kLeft) == root(kRight); }
+    bool terminal() { return red_won() || blue_won(); }
 
-    inline bool merge_sets(int a, int b) {
-        int root_a = find_root(a), root_b = find_root(b);
-        if (root_a != root_b) {
-            if (set_size[root_a] > set_size[root_b]) swap(root_a, root_b);
-            parent_node[root_a] = root_b;
-            set_size[root_b] += set_size[root_a];
-            edge_mask[root_b] |= edge_mask[root_a];
-        }
-        return edge_mask[root_b] == 3;
-    }
-};
+    bool empty(int row, int col) const { return stone[row][col] == 0; }
 
-struct HexBoard {
-    int8_t grid[CELL_COUNT];
-    DisjointSet dsu;
-
-    HexBoard() {
-        memset(grid, 0, sizeof(grid));
-        dsu.clear_all();
-    }
-
-    inline int at(int r, int c) const {
-        return grid[cell_id(r, c)];
-    }
-
-    inline bool empty(int id) const {
-        return grid[id] == 0;
-    }
-
-    bool put_piece_id(int id, int p_color) {
-        grid[id] = static_cast<int8_t>(p_color);
-        int r = id / B_SIZE, c = id % B_SIZE;
-
-        if (p_color == 1) {
-            if (r == 0) dsu.edge_mask[id] |= 1;
-            if (r == B_SIZE - 1) dsu.edge_mask[id] |= 2;
+    void fill_pair_randomly(int a_row, int a_col, int b_row, int b_col) {
+        if (rng() & 1) {
+            play(a_row, a_col);
+            play(b_row, b_col);
         } else {
-            if (c == 0) dsu.edge_mask[id] |= 1;
-            if (c == B_SIZE - 1) dsu.edge_mask[id] |= 2;
-        }
-        if (dsu.edge_mask[id] == 3) return true;
-
-        for (int d = 0; d < 6; ++d) {
-            int nr = r + DIR_R[d], nc = c + DIR_C[d];
-            if (in_board(nr, nc)) {
-                int nid = cell_id(nr, nc);
-                if (grid[nid] == p_color && dsu.merge_sets(id, nid)) return true;
-            }
-        }
-        return false;
-    }
-
-    inline bool put_piece(int r, int c, int p_color) {
-        return put_piece_id(cell_id(r, c), p_color);
-    }
-};
-
-double eval_position_id(int id, const HexBoard& b, int self_color) {
-    int r = id / B_SIZE, c = id % B_SIZE;
-    double base_val = 10.0 - abs(r - 5) - abs(c - 5);
-
-    for (int k = 0; k < 6; ++k) {
-        int adj_r = r + DIR_R[k], adj_c = c + DIR_C[k];
-        if (in_board(adj_r, adj_c)) {
-            int val = b.at(adj_r, adj_c);
-            if (val == self_color) base_val += 30.0;
-            else if (val == -self_color) base_val += 20.0;
-        }
-
-        int bg_r = r + BRG_R[k], bg_c = c + BRG_C[k];
-        if (in_board(bg_r, bg_c)) {
-            int val = b.at(bg_r, bg_c);
-            if (val == self_color) base_val += 60.0;
-            else if (val == -self_color) base_val += 30.0;
+            play(b_row, b_col);
+            play(a_row, a_col);
         }
     }
 
-    base_val += (self_color == 1 ? (5.0 - abs(r - 5)) : (5.0 - abs(c - 5))) * 5.0;
-    return base_val;
-}
+    void reinforce_virtual_connections() {
+        for (int row = 0; row < kSide; ++row) {
+            for (int col = 0; col < kSide; ++col) {
+                const int owner = color(row, col);
+                if (owner == 0) continue;
 
-inline double normalized_prior(double raw_score) {
-    return clamp((raw_score + 50.0) / 250.0, 0.0, 1.0);
-}
+                if (inside(row + 1, col - 2) && col - 2 > 0 && owner == color(row + 1, col - 2) &&
+                    empty(row + 1, col - 1) && empty(row, col - 1)) {
+                    fill_pair_randomly(row + 1, col - 1, row, col - 1);
+                }
+                if (inside(row + 1, col + 1) && owner == color(row + 1, col + 1) &&
+                    empty(row, col + 1) && empty(row + 1, col)) {
+                    fill_pair_randomly(row, col + 1, row + 1, col);
+                }
+                if (inside(row + 2, col - 1) && col - 1 > 0 && owner == color(row + 2, col - 1) &&
+                    empty(row + 1, col - 1) && empty(row + 1, col)) {
+                    fill_pair_randomly(row + 1, col - 1, row + 1, col);
+                }
 
-struct TreeNode {
-    int8_t r_idx, c_idx, player_color;
-    int visit_count;
-    double win_score, prior_val;
-    int p_node, head_child, right_bro;
-    uint8_t pend_id[CELL_COUNT];
-    int pend_size;
-};
-
-struct Action {
-    double score;
-    uint8_t id;
-
-    bool operator<(const Action& other) const {
-        return score < other.score;
-    }
-};
-
-TreeNode* tree_nodes;
-int total_nodes = 0;
-
-int spawn_node(int move_r, int move_c, int move_col, int parent, const HexBoard& b, int root_color) {
-    int cur_id = ++total_nodes;
-    TreeNode& nd = tree_nodes[cur_id];
-    nd.r_idx = static_cast<int8_t>(move_r);
-    nd.c_idx = static_cast<int8_t>(move_c);
-    nd.player_color = static_cast<int8_t>(move_col);
-    nd.visit_count = 0;
-    nd.win_score = 0.0;
-    nd.p_node = parent;
-    nd.head_child = 0;
-    nd.right_bro = 0;
-    nd.pend_size = 0;
-
-    bool has_piece = false;
-    bool near_piece[CELL_COUNT] = {};
-
-    for (int id = 0; id < CELL_COUNT; ++id) {
-        if (b.grid[id] == 0) continue;
-        has_piece = true;
-        int r = id / B_SIZE, c = id % B_SIZE;
-        for (int dy = -2; dy <= 2; ++dy) {
-            for (int dx = -2; dx <= 2; ++dx) {
-                int nr = r + dy, nc = c + dx;
-                if (in_board(nr, nc)) {
-                    int dist = max(max(abs(dy), abs(dx)), abs(dy + dx));
-                    if (dist <= 2) near_piece[cell_id(nr, nc)] = true;
+                if (owner == 1 && row == 1 && col < kSide - 1 && empty(row - 1, col) && empty(row - 1, col + 1)) {
+                    fill_pair_randomly(row - 1, col, row - 1, col + 1);
+                }
+                if (owner == 1 && row == kSide - 2 && col > 0 && empty(row + 1, col - 1) && empty(row + 1, col)) {
+                    fill_pair_randomly(row + 1, col, row + 1, col - 1);
+                }
+                if (owner == -1 && row < kSide - 1 && col == 1 && empty(row, col - 1) && empty(row + 1, col - 1)) {
+                    fill_pair_randomly(row, col - 1, row + 1, col - 1);
+                }
+                if (owner == -1 && row > 0 && col == kSide - 2 && empty(row, col + 1) && empty(row - 1, col + 1)) {
+                    fill_pair_randomly(row, col + 1, row - 1, col + 1);
                 }
             }
         }
     }
+};
 
-    Action actions[CELL_COUNT];
-    int action_count = 0;
+Position root_position;
+array<array<int, kSide>, kSide> distance_from_stone;
+array<int, kCells> queue_row{}, queue_col{}, candidate_id{};
 
-    for (int id = 0; id < CELL_COUNT; ++id) {
-        if (!b.empty(id)) continue;
-        if (!has_piece || near_piece[id]) {
-            actions[action_count++] = {
-                eval_position_id(id, b, root_color),
-                static_cast<uint8_t>(id)
+struct SearchTree {
+    unique_ptr<int[]> move_id, next_sibling, first_child, visits, wins;
+    int cursor = 1;
+
+    SearchTree()
+        : move_id(new int[kNodeLimit]()),
+          next_sibling(new int[kNodeLimit]()),
+          first_child(new int[kNodeLimit]()),
+          visits(new int[kNodeLimit]()),
+          wins(new int[kNodeLimit]()) {}
+
+    void reset_cursor() { cursor = 1; }
+
+    pair<int, int> choose_child_or_expand() {
+        if (first_child[cursor] == 0) {
+            for (auto& row : distance_from_stone) row.fill(-1);
+            int head = 0, tail = -1, count = 0;
+
+            for (int r = 0; r < kSide; ++r) {
+                for (int c = 0; c < kSide; ++c) {
+                    if (root_position.color(r, c) == 0) continue;
+                    distance_from_stone[r][c] = 0;
+                    queue_row[++tail] = r;
+                    queue_col[tail] = c;
+                }
+            }
+
+            while (head <= tail) {
+                const int row = queue_row[head];
+                const int col = queue_col[head++];
+                if (distance_from_stone[row][col] == search_radius) break;
+                for (int dir = 0; dir < 6; ++dir) {
+                    const int nr = row + kDr[dir];
+                    const int nc = col + kDc[dir];
+                    if (inside(nr, nc) && distance_from_stone[nr][nc] == -1) {
+                        distance_from_stone[nr][nc] = distance_from_stone[row][col] + 1;
+                        queue_row[++tail] = nr;
+                        queue_col[tail] = nc;
+                        candidate_id[++count] = to_id(nr, nc);
+                    }
+                }
+            }
+
+            shuffle(candidate_id.begin() + 1, candidate_id.begin() + count + 1, rng);
+            for (int i = 1; i <= count; ++i) {
+                const int node = ++generated_nodes;
+                move_id[node] = candidate_id[i];
+                next_sibling[node] = first_child[cursor];
+                first_child[cursor] = node;
+            }
+            return {move_id[first_child[cursor]], -first_child[cursor]};
+        }
+
+        int selected_node = 0;
+        int selected_move = 0;
+        double best_score = -1e100;
+        for (int node = first_child[cursor]; node != 0; node = next_sibling[node]) {
+            if (visits[node] == 0) return {move_id[node], node};
+            const double exploitation = static_cast<double>(wins[node]) / visits[node];
+            const double exploration = kExplore * sqrt(log(max(1, visits[cursor])) / visits[node]);
+            const double score = exploitation + exploration;
+            if (score > best_score) {
+                best_score = score;
+                selected_node = node;
+                selected_move = move_id[node];
+            }
+        }
+        return {selected_move, selected_node};
+    }
+
+    void random_completion() {
+        shuffle(cells.begin(), cells.end(), rng);
+        for (const auto& [row, col] : cells) {
+            if (!root_position.empty(row, col)) {
+                if (root_position.terminal()) return;
+                continue;
+            }
+
+            root_position.play(row, col);
+            const int owner = root_position.color(row, col);
+
+            auto try_bridge = [&](int ar, int ac, int br, int bc, int cr, int cc) -> bool {
+                if (!inside(ar, ac) || owner != root_position.color(ar, ac)) return false;
+                if (!root_position.empty(br, bc) || !root_position.empty(cr, cc)) return false;
+                root_position.fill_pair_randomly(br, bc, cr, cc);
+                return root_position.terminal();
             };
+
+            if (try_bridge(row - 2, col + 1, row - 1, col, row - 1, col + 1)) return;
+            if (try_bridge(row - 1, col - 1, row - 1, col, row, col - 1)) return;
+            if (try_bridge(row - 1, col + 2, row - 1, col + 1, row, col + 1)) return;
+            if (col - 2 > 0 && try_bridge(row + 1, col - 2, row + 1, col - 1, row, col - 1)) return;
+            if (try_bridge(row + 1, col + 1, row, col + 1, row + 1, col)) return;
+            if (col - 1 > 0 && try_bridge(row + 2, col - 1, row + 1, col - 1, row + 1, col)) return;
+
+            if (owner == 1 && row == 1 && col < kSide - 1 && root_position.empty(row - 1, col) && root_position.empty(row - 1, col + 1)) {
+                root_position.fill_pair_randomly(row - 1, col, row - 1, col + 1);
+            }
+            if (owner == 1 && row == kSide - 2 && col > 0 && root_position.empty(row + 1, col - 1) && root_position.empty(row + 1, col)) {
+                root_position.fill_pair_randomly(row + 1, col, row + 1, col - 1);
+            }
+            if (owner == -1 && row < kSide - 1 && col == 1 && root_position.empty(row, col - 1) && root_position.empty(row + 1, col - 1)) {
+                root_position.fill_pair_randomly(row, col - 1, row + 1, col - 1);
+            }
+            if (owner == -1 && row > 0 && col == kSide - 2 && root_position.empty(row, col + 1) && root_position.empty(row - 1, col + 1)) {
+                root_position.fill_pair_randomly(row, col + 1, row - 1, col + 1);
+            }
+            if (root_position.terminal()) return;
         }
     }
 
-    if (action_count == 0) {
-        for (int id = 0; id < CELL_COUNT; ++id) {
-            if (b.empty(id)) {
-                actions[action_count++] = {
-                    eval_position_id(id, b, root_color),
-                    static_cast<uint8_t>(id)
-                };
+    void iteration(const Position& input_position) {
+        root_position = input_position;
+        vector<int> path{1};
+        cursor = 1;
+
+        while (!root_position.terminal()) {
+            const auto [choice, next_node] = choose_child_or_expand();
+            root_position.play(row_of(choice), col_of(choice));
+            if (next_node < 0) break;
+            path.push_back(next_node);
+            cursor = next_node;
+        }
+
+        Position bridge_seed = root_position;
+        bridge_seed.reinforce_virtual_connections();
+        for (int sample = 0; sample < 3; ++sample) {
+            root_position = bridge_seed;
+            random_completion();
+            const int winner = root_position.red_won() ? 1 : -1;
+            int side_to_move = input_position.turn;
+            for (const int node : path) {
+                ++visits[node];
+                if (side_to_move != winner) ++wins[node];
+                side_to_move = -side_to_move;
             }
         }
     }
 
-    sort(actions, actions + action_count);
-    for (int i = 0; i < action_count; ++i) {
-        nd.pend_id[nd.pend_size] = actions[i].id;
-        ++nd.pend_size;
+    int best_root_move() const {
+        int best_move = 0;
+        int best_wins = -1;
+        for (int node = first_child[1]; node != 0; node = next_sibling[node]) {
+            if (wins[node] > best_wins) {
+                best_wins = wins[node];
+                best_move = move_id[node];
+            }
+        }
+        return best_move;
     }
+};
 
-    nd.prior_val = (move_r == -1) ? 0.0 : normalized_prior(eval_position_id(cell_id(move_r, move_c), b, root_color));
-    return cur_id;
+SearchTree mcts;
+
+const int kThirdMoveBook[kCells] = {
+-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+-1,-1,-1,80,40,45,80,48,50,45,-1,
+-1,35,73,34,40,40,73,73,45,-1,-1,
+-1,73,80,80,50,80,61,73,80,45,45,
+-1,80,80,45,45,50,42,80,80,50,58,
+40,70,45,59,45,80,80,80,80,72,80,
+84,85,51,45,45,70,80,80,80,51,80,
+59,80,80,51,45,80,70,70,80,72,60,
+50,59,45,69,80,80,80,70,70,80,72,
+42,71,100,80,80,70,96,70,70,80,40,
+-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+const int kFourthMoveBook[kCells] = {
+-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+40,40,-1,40,40,40,28,40,95,51,62,
+71,40,40,40,71,40,96,47,83,62,95,
+95,36,95,95,95,50,95,83,83,40,20,
+40,71,71,71,71,71,71,62,29,40,40,
+92,95,40,71,71,71,40,40,40,96,96,
+40,40,59,71,81,40,40,84,40,96,40,
+40,93,90,-1,70,71,50,50,40,107,40,
+47,40,79,71,71,40,40,84,50,50,40,
+40,40,40,40,40,50,50,40,40,40,40,
+-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+int search_answer(const Position& input_position) {
+    while ((clock() - started_at) / static_cast<double>(CLOCKS_PER_SEC) < kThinkSeconds &&
+           generated_nodes <= kNodeLimit - 130) {
+        mcts.iteration(input_position);
+    }
+    return mcts.best_root_move();
 }
 
-inline int play_and_flip(HexBoard& b, int id, int& current_player) {
-    if (b.put_piece_id(id, current_player)) return current_player;
-    current_player = -current_player;
-    return 0;
+int choose_move(const Position& input_position, bool forced_start) {
+    if (forced_start) return to_id(1, 2);
+
+    int occupied = 0;
+    for (int row = 0; row < kSide; ++row) {
+        for (int col = 0; col < kSide; ++col) {
+            occupied += input_position.color(row, col) != 0;
+        }
+    }
+
+    search_radius = occupied <= 6 ? 3 : 2;
+    if (occupied == 1) return to_id(7, 3);
+
+    if (occupied == 2) {
+        int peer = 0;
+        for (int row = 0; row < kSide; ++row) {
+            for (int col = 0; col < kSide; ++col) {
+                if (row == 1 && col == 2) continue;
+                if (input_position.color(row, col) != 0) peer = to_id(row, col);
+            }
+        }
+        if (kThirdMoveBook[peer] != -1) return kThirdMoveBook[peer];
+        search_radius = 20;
+        return search_answer(input_position);
+    }
+
+    if (occupied == 3) {
+        int peer = 0;
+        for (int row = 0; row < kSide; ++row) {
+            for (int col = 0; col < kSide; ++col) {
+                if (row == 1 && col == 2) continue;
+                if (row == 7 && col == 3) continue;
+                if (input_position.color(row, col) != 0) peer = to_id(row, col);
+            }
+        }
+        if (kFourthMoveBook[peer] != -1) return kFourthMoveBook[peer];
+        search_radius = 20;
+        return search_answer(input_position);
+    }
+
+    return search_answer(input_position);
 }
 
-int fast_playout(HexBoard curr_b, int current_player) {
-    int empties[CELL_COUNT], e_cnt = 0;
-    for (int id = 0; id < CELL_COUNT; ++id) {
-        if (curr_b.empty(id)) empties[e_cnt++] = id;
-    }
-
-    shuffle(empties, empties + e_cnt, rand_gen);
-
-    auto try_pair = [&](int id1, int id2) -> int {
-        if (rand_gen() & 1) swap(id1, id2);
-        int winner = play_and_flip(curr_b, id1, current_player);
-        if (winner) return winner;
-        return play_and_flip(curr_b, id2, current_player);
-    };
-
-    for (int idx = 0; idx < e_cnt; ++idx) {
-        int id = empties[idx];
-        if (!curr_b.empty(id)) continue;
-
-        int r = id / B_SIZE, c = id % B_SIZE;
-        int winner = play_and_flip(curr_b, id, current_player);
-        if (winner) return winner;
-
-#define REPAIR_BRIDGE(br, bc, m1r, m1c, m2r, m2c) \
-        if (in_board((br), (bc)) && curr_b.grid[id] == curr_b.grid[cell_id((br), (bc))]) { \
-            int m1 = cell_id((m1r), (m1c)), m2 = cell_id((m2r), (m2c)); \
-            if (curr_b.empty(m1) && curr_b.empty(m2)) { \
-                int res = try_pair(m1, m2); \
-                if (res) return res; \
-            } \
-        }
-
-        REPAIR_BRIDGE(r - 2, c + 1, r - 1, c, r - 1, c + 1)
-        REPAIR_BRIDGE(r - 1, c - 1, r - 1, c, r, c - 1)
-        REPAIR_BRIDGE(r - 1, c + 2, r - 1, c + 1, r, c + 1)
-        REPAIR_BRIDGE(r + 1, c - 2, r + 1, c - 1, r, c - 1)
-        REPAIR_BRIDGE(r + 1, c + 1, r, c + 1, r + 1, c)
-        REPAIR_BRIDGE(r + 2, c - 1, r + 1, c - 1, r + 1, c)
-
-#undef REPAIR_BRIDGE
-
-        if (curr_b.grid[id] == 1) {
-            if (r == 1 && c < 10) {
-                int a = cell_id(r - 1, c), b = cell_id(r - 1, c + 1);
-                if (curr_b.empty(a) && curr_b.empty(b)) {
-                    int res = try_pair(a, b);
-                    if (res) return res;
-                }
-            }
-            if (r == 9 && c > 0) {
-                int a = cell_id(r + 1, c), b = cell_id(r + 1, c - 1);
-                if (curr_b.empty(a) && curr_b.empty(b)) {
-                    int res = try_pair(a, b);
-                    if (res) return res;
-                }
-            }
-        } else if (curr_b.grid[id] == -1) {
-            if (c == 1 && r < 10) {
-                int a = cell_id(r, c - 1), b = cell_id(r + 1, c - 1);
-                if (curr_b.empty(a) && curr_b.empty(b)) {
-                    int res = try_pair(a, b);
-                    if (res) return res;
-                }
-            }
-            if (c == 9 && r > 0) {
-                int a = cell_id(r, c + 1), b = cell_id(r - 1, c + 1);
-                if (curr_b.empty(a) && curr_b.empty(b)) {
-                    int res = try_pair(a, b);
-                    if (res) return res;
-                }
-            }
-        }
-    }
-
-    return 0;
+Json::Value make_response(const Position& position, bool forced_start) {
+    const int action = choose_move(position, forced_start);
+    Json::Value out;
+    out["x"] = row_of(action);
+    out["y"] = col_of(action);
+    return out;
 }
 
-pair<int, int> execute_mcts(HexBoard& base_state, int my_side) {
-    for (int id = 0; id < CELL_COUNT; ++id) {
-        if (base_state.empty(id)) {
-            HexBoard attack = base_state;
-            if (attack.put_piece_id(id, my_side)) return {id / B_SIZE, id % B_SIZE};
-
-            HexBoard defend = base_state;
-            if (defend.put_piece_id(id, -my_side)) return {id / B_SIZE, id % B_SIZE};
-        }
-    }
-
-    total_nodes = 0;
-    int root_idx = spawn_node(-1, -1, -my_side, 0, base_state, my_side);
-    auto started_at = chrono::steady_clock::now();
-
-    while (chrono::duration<double>(chrono::steady_clock::now() - started_at).count() < TIME_LIMIT_SEC &&
-           total_nodes < POOL_CAPACITY - 150) {
-        int track_node = root_idx, active_side = my_side;
-        HexBoard sim_board = base_state;
-
-        while (tree_nodes[track_node].pend_size == 0 && tree_nodes[track_node].head_child != 0) {
-            double highest_ucb = -1e19;
-            int selected_child = 0;
-            const double parent_log = log(tree_nodes[track_node].visit_count + 1.0);
-
-            for (int ch = tree_nodes[track_node].head_child; ch != 0; ch = tree_nodes[ch].right_bro) {
-                double visits = tree_nodes[ch].visit_count + 1e-7;
-                double final_uct = (tree_nodes[ch].win_score / visits) +
-                                   EXPLORE_RATE * sqrt(parent_log / visits) +
-                                   (PRIOR_WEIGHT * tree_nodes[ch].prior_val) / (tree_nodes[ch].visit_count + 1);
-                if (final_uct > highest_ucb) {
-                    highest_ucb = final_uct;
-                    selected_child = ch;
-                }
-            }
-
-            track_node = selected_child;
-            int move_id = cell_id(tree_nodes[track_node].r_idx, tree_nodes[track_node].c_idx);
-            sim_board.put_piece_id(move_id, tree_nodes[track_node].player_color);
-            active_side = -tree_nodes[track_node].player_color;
-        }
-
-        if (tree_nodes[track_node].pend_size > 0) {
-            --tree_nodes[track_node].pend_size;
-            int next_id = tree_nodes[track_node].pend_id[tree_nodes[track_node].pend_size];
-            int nr = next_id / B_SIZE, nc = next_id % B_SIZE;
-            sim_board.put_piece_id(next_id, active_side);
-
-            int new_ch = spawn_node(nr, nc, active_side, track_node, sim_board, my_side);
-            tree_nodes[new_ch].right_bro = tree_nodes[track_node].head_child;
-            tree_nodes[track_node].head_child = new_ch;
-            track_node = new_ch;
-            active_side = -active_side;
-        }
-
-        int match_result = fast_playout(sim_board, active_side);
-
-        while (track_node != 0) {
-            ++tree_nodes[track_node].visit_count;
-            if (match_result == my_side) tree_nodes[track_node].win_score += 1.0;
-            else if (match_result != 0) tree_nodes[track_node].win_score -= 0.6;
-            track_node = tree_nodes[track_node].p_node;
-        }
-    }
-
-    pair<int, int> best_step = {-1, -1};
-    int most_visits = -1;
-    for (int ch = tree_nodes[root_idx].head_child; ch != 0; ch = tree_nodes[ch].right_bro) {
-        if (tree_nodes[ch].visit_count > most_visits) {
-            most_visits = tree_nodes[ch].visit_count;
-            best_step = {tree_nodes[ch].r_idx, tree_nodes[ch].c_idx};
-        }
-    }
-    return best_step;
-}
+}  // namespace
 
 int main() {
-    ios_base::sync_with_stdio(false);
-    cin.tie(nullptr);
-
-    tree_nodes = new TreeNode[POOL_CAPACITY];
-
-    int total_turns, op_x, op_y;
-    if (!(cin >> total_turns)) {
-        delete[] tree_nodes;
-        return 0;
+    started_at = clock();
+    for (int row = 0; row < kSide; ++row) {
+        for (int col = 0; col < kSide; ++col) cells.emplace_back(row, col);
     }
 
-    HexBoard current_game;
-    for (int t = 0; t < total_turns - 1; ++t) {
-        cin >> op_x >> op_y;
-        if (op_x != -1) current_game.put_piece(op_x, op_y, -1);
+    string payload;
+    getline(cin, payload);
 
-        cin >> op_x >> op_y;
-        if (op_x != -1) current_game.put_piece(op_x, op_y, 1);
+    Json::Reader reader;
+    Json::Value input_json;
+    reader.parse(payload, input_json);
+
+    Position game;
+    const int finished_turns = input_json["responses"].size();
+    for (int turn = 0; turn < finished_turns; ++turn) {
+        int x = input_json["requests"][turn]["x"].asInt();
+        int y = input_json["requests"][turn]["y"].asInt();
+        if (x >= 0 && y >= 0) game.play(x, y);
+
+        x = input_json["responses"][turn]["x"].asInt();
+        y = input_json["responses"][turn]["y"].asInt();
+        game.play(x, y);
     }
 
-    cin >> op_x >> op_y;
-    int team_flag = (op_x == -1 && total_turns == 1) ? 1 : -1;
-
-    if (total_turns == 1 && team_flag == 1) {
-        cout << "1 2\n";
-        delete[] tree_nodes;
-        return 0;
+    const int request_x = input_json["requests"][finished_turns]["x"].asInt();
+    const int request_y = input_json["requests"][finished_turns]["y"].asInt();
+    bool forced_start = false;
+    if (request_x >= 0 && request_y >= 0) {
+        game.play(request_x, request_y);
+    } else {
+        forced_start = input_json["requests"][0].isMember("forced_x");
     }
 
-    if (op_x != -1) current_game.put_piece(op_x, op_y, -team_flag);
+    Json::Value result;
+    result["response"] = make_response(game, forced_start);
 
-    pair<int, int> decision = execute_mcts(current_game, team_flag);
-    cout << decision.first << ' ' << decision.second << '\n';
-
-    delete[] tree_nodes;
+    Json::FastWriter writer;
+    cout << writer.write(result) << '\n';
     return 0;
 }

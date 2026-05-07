@@ -275,6 +275,48 @@ vector<int> legal_moves(const Board& board) {
     return result;
 }
 
+int best_tactical_root_move(const Board& board) {
+    vector<int> empties = legal_moves(board);
+    if (empties.empty()) return -1;
+
+    const int win = immediate_win(board, empties, board.turn);
+    if (win != -1) return win;
+    const int block = immediate_win(board, empties, -board.turn);
+    if (block != -1) return block;
+
+    const PathInfo own_path = evaluate_paths(board, board.turn);
+    const PathInfo opp_path = evaluate_paths(board, -board.turn);
+    int best = empties.front();
+    double best_score = -1e100;
+
+    for (int id : empties) {
+        Board child = board;
+        child.play_id(id, board.turn);
+        vector<int> child_empties = legal_moves(child);
+
+        double score = static_move_score(board, id, board.turn) + 0.85 * static_move_score(board, id, -board.turn);
+        const int own_span = span_after_move(own_path, id);
+        const int opp_span = span_after_move(opp_path, id);
+        if (own_span < kInf) score += 130.0 / (1.0 + own_span);
+        if (opp_span < kInf) score += 120.0 / (1.0 + opp_span);
+        if (own_span == own_path.best) score += 95.0;
+        if (opp_span == opp_path.best) score += 90.0;
+
+        const PathInfo child_own = evaluate_paths(child, board.turn);
+        const PathInfo child_opp = evaluate_paths(child, -board.turn);
+        score += 160.0 * (child_opp.best - child_own.best);
+
+        if (immediate_win(child, child_empties, -board.turn) != -1) score -= 100000.0;
+        if (immediate_win(child, child_empties, board.turn) != -1) score += 650.0;
+
+        if (score > best_score) {
+            best_score = score;
+            best = id;
+        }
+    }
+    return best;
+}
+
 int choose_rollout_move(const Board& board, const vector<int>& empties, int color, int last_move) {
     const int win = immediate_win(board, empties, color);
     if (win != -1) return win;
@@ -456,6 +498,7 @@ pair<int, int> search(Board root_board) {
     if (move != -1) return {row_of(move), col_of(move)};
     move = immediate_win(root_board, root_legal, -root_board.turn);
     if (move != -1) return {row_of(move), col_of(move)};
+    const int tactical_root_move = best_tactical_root_move(root_board);
 
     root_color = root_board.turn;
     tree.clear();
@@ -481,7 +524,15 @@ pair<int, int> search(Board root_board) {
         }
 
         if (winner == 0 && !tree[node_id].untried.empty()) {
-            const int idx = rng() % tree[node_id].untried.size();
+            int idx = rng() % tree[node_id].untried.size();
+            if (node_id == 0 && tactical_root_move != -1) {
+                for (int i = 0; i < static_cast<int>(tree[node_id].untried.size()); ++i) {
+                    if (tree[node_id].untried[i] == tactical_root_move) {
+                        idx = i;
+                        break;
+                    }
+                }
+            }
             const int next_move = tree[node_id].untried[idx];
             tree[node_id].untried[idx] = tree[node_id].untried.back();
             tree[node_id].untried.pop_back();
@@ -517,6 +568,7 @@ pair<int, int> search(Board root_board) {
     }
 
     if (best_child != -1) return {row_of(tree[best_child].move), col_of(tree[best_child].move)};
+    if (tactical_root_move != -1) return {row_of(tactical_root_move), col_of(tactical_root_move)};
     if (!root_legal.empty()) return {row_of(root_legal.front()), col_of(root_legal.front())};
     return {0, 0};
 }

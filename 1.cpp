@@ -1,6 +1,204 @@
 #pragma GCC optimize("O3,unroll-loops")
 #include <bits/stdc++.h>
-#include "jsoncpp/json.h"
+#ifndef __has_include
+#  define __has_include(header) 0
+#endif
+#if __has_include("jsoncpp/json.h")
+#  include "jsoncpp/json.h"
+#elif __has_include(<jsoncpp/json/json.h>)
+#  include <jsoncpp/json/json.h>
+#elif __has_include(<json/json.h>)
+#  include <json/json.h>
+#else
+namespace Json {
+using std::isdigit;
+using std::isspace;
+using std::map;
+using std::size_t;
+using std::string;
+using std::to_string;
+using std::vector;
+
+class Value {
+public:
+    enum Type { kNull, kInt, kObject, kArray };
+    Type type = kNull;
+    int int_value = 0;
+    map<string, Value> object_value;
+    vector<Value> array_value;
+
+    Value& operator[](const string& key) {
+        if (type != kObject) {
+            type = kObject;
+            object_value.clear();
+        }
+        return object_value[key];
+    }
+
+    const Value& operator[](const string& key) const {
+        static const Value empty;
+        map<string, Value>::const_iterator it = object_value.find(key);
+        return it == object_value.end() ? empty : it->second;
+    }
+
+    Value& operator[](const char* key) { return (*this)[string(key)]; }
+    const Value& operator[](const char* key) const { return (*this)[string(key)]; }
+
+    Value& operator[](int index) {
+        if (type != kArray) {
+            type = kArray;
+            array_value.clear();
+        }
+        if (index >= static_cast<int>(array_value.size())) array_value.resize(index + 1);
+        return array_value[index];
+    }
+
+    const Value& operator[](int index) const {
+        static const Value empty;
+        if (type != kArray || index < 0 || index >= static_cast<int>(array_value.size())) return empty;
+        return array_value[index];
+    }
+
+    Value& operator=(int value) {
+        type = kInt;
+        int_value = value;
+        object_value.clear();
+        array_value.clear();
+        return *this;
+    }
+
+    int asInt() const { return int_value; }
+    int size() const { return type == kArray ? static_cast<int>(array_value.size()) : 0; }
+    bool isMember(const char* key) const { return type == kObject && object_value.find(key) != object_value.end(); }
+};
+
+class Reader {
+public:
+    bool parse(const string& text, Value& out) {
+        pos_ = 0;
+        text_ = &text;
+        return parse_value(out);
+    }
+
+private:
+    const string* text_ = nullptr;
+    size_t pos_ = 0;
+
+    void skip_ws() {
+        while (pos_ < text_->size() && isspace(static_cast<unsigned char>((*text_)[pos_]))) ++pos_;
+    }
+
+    bool consume(char expected) {
+        skip_ws();
+        if (pos_ >= text_->size() || (*text_)[pos_] != expected) return false;
+        ++pos_;
+        return true;
+    }
+
+    bool parse_string(string& out) {
+        if (!consume('"')) return false;
+        out.clear();
+        while (pos_ < text_->size()) {
+            char ch = (*text_)[pos_++];
+            if (ch == '"') return true;
+            if (ch == '\\' && pos_ < text_->size()) ch = (*text_)[pos_++];
+            out.push_back(ch);
+        }
+        return false;
+    }
+
+    bool parse_number(Value& out) {
+        skip_ws();
+        int sign = 1;
+        if (pos_ < text_->size() && (*text_)[pos_] == '-') {
+            sign = -1;
+            ++pos_;
+        }
+        int value = 0;
+        bool seen_digit = false;
+        while (pos_ < text_->size() && isdigit(static_cast<unsigned char>((*text_)[pos_]))) {
+            seen_digit = true;
+            value = value * 10 + ((*text_)[pos_++] - '0');
+        }
+        if (!seen_digit) return false;
+        out = sign * value;
+        return true;
+    }
+
+    bool parse_array(Value& out) {
+        if (!consume('[')) return false;
+        out.type = Value::kArray;
+        out.array_value.clear();
+        skip_ws();
+        if (consume(']')) return true;
+        do {
+            Value item;
+            if (!parse_value(item)) return false;
+            out.array_value.push_back(item);
+            skip_ws();
+        } while (consume(','));
+        return consume(']');
+    }
+
+    bool parse_object(Value& out) {
+        if (!consume('{')) return false;
+        out.type = Value::kObject;
+        out.object_value.clear();
+        skip_ws();
+        if (consume('}')) return true;
+        do {
+            string key;
+            Value value;
+            if (!parse_string(key) || !consume(':') || !parse_value(value)) return false;
+            out.object_value[key] = value;
+            skip_ws();
+        } while (consume(','));
+        return consume('}');
+    }
+
+    bool parse_value(Value& out) {
+        skip_ws();
+        if (pos_ >= text_->size()) return false;
+        const char ch = (*text_)[pos_];
+        if (ch == '{') return parse_object(out);
+        if (ch == '[') return parse_array(out);
+        if (ch == '-' || isdigit(static_cast<unsigned char>(ch))) return parse_number(out);
+        return false;
+    }
+};
+
+class FastWriter {
+public:
+    string write(const Value& value) { return write_value(value); }
+
+private:
+    string write_value(const Value& value) {
+        if (value.type == Value::kInt) return to_string(value.int_value);
+        if (value.type == Value::kArray) {
+            string out = "[";
+            for (size_t i = 0; i < value.array_value.size(); ++i) {
+                if (i) out += ',';
+                out += write_value(value.array_value[i]);
+            }
+            out += "]";
+            return out;
+        }
+        if (value.type == Value::kObject) {
+            string out = "{";
+            bool first = true;
+            for (map<string, Value>::const_iterator it = value.object_value.begin(); it != value.object_value.end(); ++it) {
+                if (!first) out += ',';
+                first = false;
+                out += string("\"") + it->first + "\":" + write_value(it->second);
+            }
+            out += "}";
+            return out;
+        }
+        return "null";
+    }
+};
+}  // namespace Json
+#endif
 
 using namespace std;
 namespace {
@@ -132,7 +330,8 @@ public:
 
 Position root_position;
 array<array<int, kSide>, kSide> distance_from_stone;
-array<int, kCells> queue_row{}, queue_col{}, candidate_id{};
+array<int, kCells> queue_row{}, queue_col{};
+array<int, kCells + 1> candidate_id{};
 
 struct SearchTree {
     unique_ptr<int[]> move_id, next_sibling, first_child, visits, wins;
@@ -206,7 +405,9 @@ struct SearchTree {
 
     void random_completion() {
         shuffle(cells.begin(), cells.end(), rng);
-        for (const auto& [row, col] : cells) {
+        for (const auto& cell : cells) {
+            const int row = cell.first;
+            const int col = cell.second;
             if (!root_position.empty(row, col)) {
                 if (root_position.terminal()) return;
                 continue;
@@ -251,7 +452,9 @@ struct SearchTree {
         cursor = 1;
 
         while (!root_position.terminal()) {
-            const auto [choice, next_node] = choose_child_or_expand();
+            const pair<int, int> selection = choose_child_or_expand();
+            const int choice = selection.first;
+            const int next_node = selection.second;
             root_position.play(row_of(choice), col_of(choice));
             if (next_node < 0) break;
             path.push_back(next_node);

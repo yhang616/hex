@@ -35,6 +35,35 @@ constexpr int kRolloutRandomPercent = 7;
 constexpr int kNodeReserve = 180000;
 constexpr int kInf = 1000000000;
 
+
+constexpr array<int, kCellCount> kThirdMoveBook = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,80,40,45,80,48,50,45,-1,
+    -1,35,73,34,40,40,73,73,45,-1,-1,
+    -1,73,80,80,50,80,61,73,80,45,45,
+    -1,80,80,45,45,50,42,80,80,50,58,
+    40,70,45,59,45,80,80,80,80,72,80,
+    84,85,51,45,45,70,80,80,80,51,80,
+    59,80,80,51,45,80,70,70,80,72,60,
+    50,59,45,69,80,80,80,70,70,80,72,
+    42,71,100,80,80,70,96,70,70,80,40,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
+constexpr array<int, kCellCount> kFourthMoveBook = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    40,40,-1,40,40,40,28,40,95,51,62,
+    71,40,40,40,71,40,96,47,83,62,95,
+    95,36,95,95,95,50,95,83,83,40,20,
+    40,71,71,71,71,71,71,62,29,40,40,
+    92,95,40,71,71,71,40,40,40,96,96,
+    40,40,59,71,81,40,40,84,40,96,40,
+    40,93,90,-1,70,71,50,50,40,107,40,
+    47,40,79,71,71,40,40,84,50,50,40,
+    40,40,40,40,40,50,50,40,40,40,40,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
 const int kDr[6] = {-1, -1, 0, 0, 1, 1};
 const int kDc[6] = {0, 1, -1, 1, -1, 0};
 
@@ -256,6 +285,41 @@ double static_move_score(const Board& board, int id, int color) {
 
     score += color == 1 ? (5.0 - abs(row - 5)) * 6.0 : (5.0 - abs(col - 5)) * 6.0;
     return score;
+}
+
+
+int stone_count(const Board& board) {
+    int count = 0;
+    for (int id = 0; id < kCellCount; ++id) count += board.stone[id] != 0;
+    return count;
+}
+
+int opening_book_move(const Board& board) {
+    const int occupied = stone_count(board);
+    auto legal_book_move = [&](int id) {
+        return 0 <= id && id < kCellCount && board.empty(id) ? id : -1;
+    };
+
+    if (occupied == 1) return legal_book_move(cell_id(7, 3));
+
+    const int swap_anchor = cell_id(1, 2);
+    const int reply_anchor = cell_id(7, 3);
+    if ((occupied == 2 && board.stone[swap_anchor] != 0) ||
+        (occupied == 3 && board.stone[swap_anchor] != 0 && board.stone[reply_anchor] != 0)) {
+        int pattern_id = -1;
+        for (int id = 0; id < kCellCount; ++id) {
+            if (board.stone[id] == 0) continue;
+            if (id == swap_anchor) continue;
+            if (occupied == 3 && id == reply_anchor) continue;
+            pattern_id = id;
+        }
+        if (pattern_id != -1) {
+            const int action = occupied == 2 ? kThirdMoveBook[pattern_id] : kFourthMoveBook[pattern_id];
+            return legal_book_move(action);
+        }
+    }
+
+    return -1;
 }
 
 int immediate_win(const Board& board, const vector<int>& empties, int color) {
@@ -570,7 +634,14 @@ int main() {
         forced_start = input_json["requests"][0].isMember("forced_x");
     }
 
-    pair<int, int> decision = forced_start ? make_pair(1, 2) : search(board);
+    pair<int, int> decision;
+    if (forced_start) {
+        decision = make_pair(1, 2);
+    } else if (const int book_move = opening_book_move(board); book_move != -1) {
+        decision = make_pair(row_of(book_move), col_of(book_move));
+    } else {
+        decision = search(board);
+    }
 
     Json::Value result;
     result["response"] = make_response(decision.first, decision.second);

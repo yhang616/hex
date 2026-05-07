@@ -12,8 +12,8 @@ constexpr int kBottom = 122;
 constexpr int kLeft = 123;
 constexpr int kRight = 124;
 constexpr int kMaxDsu = 125;
-constexpr int kNodeLimit = 10000005;
-constexpr double kThinkSeconds = 0.90;
+constexpr int kNodeLimit = 2000005;
+constexpr double kThinkSeconds = 0.55;
 constexpr double kExplore = 0.40;
 
 mt19937 rng(1);
@@ -31,7 +31,11 @@ const int kDc[6] = {0, 1, -1, 1, -1, 0};
 vector<pair<int, int>> cells;
 int generated_nodes = 1;
 int search_radius = 2;
-clock_t started_at;
+chrono::steady_clock::time_point started_at;
+
+inline bool time_remaining() {
+    return chrono::duration<double>(chrono::steady_clock::now() - started_at).count() < kThinkSeconds;
+}
 
 class Position {
 public:
@@ -247,25 +251,28 @@ struct SearchTree {
 
     void iteration(const Position& input_position) {
         root_position = input_position;
-        vector<int> path{1};
+        array<int, kCells + 1> path{};
+        int path_size = 1;
+        path[0] = 1;
         cursor = 1;
 
         while (!root_position.terminal()) {
             const auto [choice, next_node] = choose_child_or_expand();
             root_position.play(row_of(choice), col_of(choice));
             if (next_node < 0) break;
-            path.push_back(next_node);
+            path[path_size++] = next_node;
             cursor = next_node;
         }
 
         Position bridge_seed = root_position;
         bridge_seed.reinforce_virtual_connections();
-        for (int sample = 0; sample < 3; ++sample) {
+        for (int sample = 0; sample < 2 && time_remaining(); ++sample) {
             root_position = bridge_seed;
             random_completion();
             const int winner = root_position.red_won() ? 1 : -1;
             int side_to_move = input_position.turn;
-            for (const int node : path) {
+            for (int i = 0; i < path_size; ++i) {
+                const int node = path[i];
                 ++visits[node];
                 if (side_to_move != winner) ++wins[node];
                 side_to_move = -side_to_move;
@@ -316,12 +323,32 @@ const int kFourthMoveBook[kCells] = {
 -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
 };
 
+int fallback_move(const Position& input_position) {
+    int best_move = 0;
+    int best_distance = numeric_limits<int>::max();
+    for (int row = 0; row < kSide; ++row) {
+        for (int col = 0; col < kSide; ++col) {
+            if (!input_position.empty(row, col)) continue;
+            const int distance = abs(row - kSide / 2) + abs(col - kSide / 2);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best_move = to_id(row, col);
+            }
+        }
+    }
+    return best_move;
+}
+
 int search_answer(const Position& input_position) {
-    while ((clock() - started_at) / static_cast<double>(CLOCKS_PER_SEC) < kThinkSeconds &&
-           generated_nodes <= kNodeLimit - 130) {
+    while (time_remaining() && generated_nodes <= kNodeLimit - 130) {
         mcts.iteration(input_position);
     }
-    return mcts.best_root_move();
+
+    const int move = mcts.best_root_move();
+    if (inside(row_of(move), col_of(move)) && input_position.empty(row_of(move), col_of(move))) {
+        return move;
+    }
+    return fallback_move(input_position);
 }
 
 int choose_move(const Position& input_position, bool forced_start) {
@@ -378,7 +405,7 @@ Json::Value make_response(const Position& position, bool forced_start) {
 }  // namespace
 
 int main() {
-    started_at = clock();
+    started_at = chrono::steady_clock::now();
     for (int row = 0; row < kSide; ++row) {
         for (int col = 0; col < kSide; ++col) cells.emplace_back(row, col);
     }
@@ -386,9 +413,11 @@ int main() {
     string payload;
     getline(cin, payload);
 
-    Json::Reader reader;
+    Json::CharReaderBuilder reader_builder;
     Json::Value input_json;
-    reader.parse(payload, input_json);
+    string parse_errors;
+    const unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
+    reader->parse(payload.data(), payload.data() + payload.size(), &input_json, &parse_errors);
 
     Position game;
     const int finished_turns = input_json["responses"].size();
@@ -414,7 +443,8 @@ int main() {
     Json::Value result;
     result["response"] = make_response(game, forced_start);
 
-    Json::FastWriter writer;
-    cout << writer.write(result) << '\n';
+    Json::StreamWriterBuilder writer_builder;
+    writer_builder["indentation"] = "";
+    cout << Json::writeString(writer_builder, result) << '\n';
     return 0;
 }

@@ -29,42 +29,13 @@ constexpr int kBottom = 122;
 constexpr int kLeft = 123;
 constexpr int kRight = 124;
 constexpr int kDsuSize = 125;
-constexpr double kTimeLimitSeconds = 0.22;
+constexpr double kTimeLimitSeconds = 0.88;
 constexpr double kExplore = 0.55;
 constexpr int kRolloutRandomPercent = 7;
-constexpr int kNodeReserve = 70000;
+constexpr int kNodeReserve = 180000;
 constexpr int kInf = 1000000000;
 constexpr int kStaticDepth = 2;
 constexpr int kStaticBranchLimit = 14;
-
-constexpr array<int, kCellCount> kThirdMoveBook = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    -1,-1,-1,80,40,45,80,48,50,45,-1,
-    -1,35,73,34,40,40,73,73,45,-1,-1,
-    -1,73,80,80,50,80,61,73,80,45,45,
-    -1,80,80,45,45,50,42,80,80,50,58,
-    40,70,45,59,45,80,80,80,80,72,80,
-    84,85,51,45,45,70,80,80,80,51,80,
-    59,80,80,51,45,80,70,70,80,72,60,
-    50,59,45,69,80,80,80,70,70,80,72,
-    42,71,100,80,80,70,96,70,70,80,40,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-};
-
-constexpr array<int, kCellCount> kFourthMoveBook = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-    40,40,-1,40,40,40,28,40,95,51,62,
-    71,40,40,40,71,40,96,47,83,62,95,
-    95,36,95,95,95,50,95,83,83,40,20,
-    40,71,71,71,71,71,71,62,29,40,40,
-    92,95,40,71,71,71,40,40,40,96,96,
-    40,40,59,71,81,40,40,84,40,96,40,
-    40,93,90,-1,70,71,50,50,40,107,40,
-    47,40,79,71,71,40,40,84,50,50,40,
-    40,40,40,40,40,50,50,40,40,40,40,
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-};
-
 
 constexpr array<int, kCellCount> kThirdMoveBook = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -294,6 +265,36 @@ int span_after_move(const PathInfo& info, int id) {
     return info.from_start[id] + info.from_goal[id] - 1;
 }
 
+double edge_bridge_bonus(const Board& board, int id, int color) {
+    const int row = row_of(id);
+    const int col = col_of(id);
+    double bonus = 0.0;
+    auto add_if_virtual_bridge = [&](int anchor, int other_mid, int bridge_color) {
+        if (board.stone[anchor] == bridge_color && board.empty(other_mid)) {
+            bonus += bridge_color == color ? 28.0 : 18.0;
+        }
+    };
+
+    if (row == 0) {
+        if (col + 1 < kSide) add_if_virtual_bridge(cell_id(1, col), cell_id(0, col + 1), 1);
+        if (col > 0) add_if_virtual_bridge(cell_id(1, col - 1), cell_id(0, col - 1), 1);
+    }
+    if (row == kSide - 1) {
+        if (col > 0) add_if_virtual_bridge(cell_id(kSide - 2, col), cell_id(kSide - 1, col - 1), 1);
+        if (col + 1 < kSide) add_if_virtual_bridge(cell_id(kSide - 2, col + 1), cell_id(kSide - 1, col + 1), 1);
+    }
+    if (col == 0) {
+        if (row + 1 < kSide) add_if_virtual_bridge(cell_id(row, 1), cell_id(row + 1, 0), -1);
+        if (row > 0) add_if_virtual_bridge(cell_id(row - 1, 1), cell_id(row - 1, 0), -1);
+    }
+    if (col == kSide - 1) {
+        if (row > 0) add_if_virtual_bridge(cell_id(row, kSide - 2), cell_id(row - 1, kSide - 1), -1);
+        if (row + 1 < kSide) add_if_virtual_bridge(cell_id(row + 1, kSide - 2), cell_id(row + 1, kSide - 1), -1);
+    }
+    return bonus;
+}
+
+
 double static_move_score(const Board& board, int id, int color) {
     const int row = row_of(id);
     const int col = col_of(id);
@@ -314,6 +315,7 @@ double static_move_score(const Board& board, int id, int color) {
     }
 
     score += color == 1 ? (5.0 - abs(row - 5)) * 6.0 : (5.0 - abs(col - 5)) * 6.0;
+    score += edge_bridge_bonus(board, id, color);
     return score;
 }
 
@@ -369,46 +371,45 @@ vector<int> legal_moves(const Board& board) {
     return result;
 }
 
-int best_static_move(const Board& board) {
-    vector<int> empties = legal_moves(board);
-    if (empties.empty()) return -1;
 
-    const int win = immediate_win(board, empties, board.turn);
-    if (win != -1) return win;
-    const int block = immediate_win(board, empties, -board.turn);
-    if (block != -1) return block;
+int play_forced_pair(Board& board, vector<int>& empties, int& color, int first, int second) {
+    if (!board.empty(first) || !board.empty(second)) return 0;
+    if (rng() & 1) swap(first, second);
 
-    const PathInfo own_path = evaluate_paths(board, board.turn);
-    const PathInfo opp_path = evaluate_paths(board, -board.turn);
-    int best = empties.front();
-    double best_score = -1e100;
+    auto erase_empty = [&](int cell) {
+        auto it = find(empties.begin(), empties.end(), cell);
+        if (it != empties.end()) empties.erase(it);
+    };
 
-    for (int id : empties) {
-        Board child = board;
-        child.play_id(id, board.turn);
-        vector<int> child_empties = legal_moves(child);
+    erase_empty(first);
+    if (board.play_id(first, color)) return color;
+    color = -color;
 
-        double score = static_move_score(board, id, board.turn) + 0.85 * static_move_score(board, id, -board.turn);
-        const int own_span = span_after_move(own_path, id);
-        const int opp_span = span_after_move(opp_path, id);
-        if (own_span < kInf) score += 130.0 / (1.0 + own_span);
-        if (opp_span < kInf) score += 120.0 / (1.0 + opp_span);
-        if (own_span == own_path.best) score += 95.0;
-        if (opp_span == opp_path.best) score += 90.0;
+    erase_empty(second);
+    if (board.play_id(second, color)) return color;
+    color = -color;
+    return 0;
+}
 
-        const PathInfo child_own = evaluate_paths(child, board.turn);
-        const PathInfo child_opp = evaluate_paths(child, -board.turn);
-        score += 160.0 * (child_opp.best - child_own.best);
-
-        if (immediate_win(child, child_empties, -board.turn) != -1) score -= 100000.0;
-        if (immediate_win(child, child_empties, board.turn) != -1) score += 650.0;
-
-        if (score > best_score) {
-            best_score = score;
-            best = id;
+int play_edge_bridge_reply(Board& board, vector<int>& empties, int id, int placed_color, int& color) {
+    const int row = row_of(id);
+    const int col = col_of(id);
+    if (placed_color == 1) {
+        if (row == 1 && col + 1 < kSide) {
+            if (const int winner = play_forced_pair(board, empties, color, cell_id(0, col), cell_id(0, col + 1))) return winner;
+        }
+        if (row == kSide - 2 && col > 0) {
+            if (const int winner = play_forced_pair(board, empties, color, cell_id(kSide - 1, col - 1), cell_id(kSide - 1, col))) return winner;
+        }
+    } else {
+        if (col == 1 && row + 1 < kSide) {
+            if (const int winner = play_forced_pair(board, empties, color, cell_id(row, 0), cell_id(row + 1, 0))) return winner;
+        }
+        if (col == kSide - 2 && row > 0) {
+            if (const int winner = play_forced_pair(board, empties, color, cell_id(row, kSide - 1), cell_id(row - 1, kSide - 1))) return winner;
         }
     }
-    return best;
+    return 0;
 }
 
 int choose_rollout_move(const Board& board, const vector<int>& empties, int color, int last_move) {
@@ -476,24 +477,19 @@ int rollout(Board board, int color) {
         const int placed_color = color;
         color = -color;
 
+        bool bridge_replied = false;
         for (int i = 0; i < bridge_count[id]; ++i) {
             const int far = bridge_far[id][i];
             const int mid_a = bridge_mid_a[id][i];
             const int mid_b = bridge_mid_b[id][i];
             if (board.stone[far] == placed_color && board.empty(mid_a) && board.empty(mid_b)) {
-                int first = mid_a;
-                int second = mid_b;
-                if (rng() & 1) swap(first, second);
-                auto it = find(empties.begin(), empties.end(), first);
-                if (it != empties.end()) empties.erase(it);
-                if (board.play_id(first, color)) return color;
-                color = -color;
-                it = find(empties.begin(), empties.end(), second);
-                if (it != empties.end()) empties.erase(it);
-                if (board.play_id(second, color)) return color;
-                color = -color;
+                if (const int winner = play_forced_pair(board, empties, color, mid_a, mid_b)) return winner;
+                bridge_replied = true;
                 break;
             }
+        }
+        if (!bridge_replied) {
+            if (const int winner = play_edge_bridge_reply(board, empties, id, placed_color, color)) return winner;
         }
     }
     return board.red_won() ? 1 : -1;
@@ -694,8 +690,6 @@ pair<int, int> search(Board root_board) {
     if (move != -1) return {row_of(move), col_of(move)};
     move = immediate_win(root_board, root_legal, -root_board.turn);
     if (move != -1) return {row_of(move), col_of(move)};
-    const int static_fallback = best_static_move(root_board);
-
     const int static_fallback = static_search_move(root_board);
     if (!time_left() && static_fallback != -1) return {row_of(static_fallback), col_of(static_fallback)};
 

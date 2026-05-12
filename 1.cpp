@@ -371,42 +371,6 @@ vector<int> legal_moves(const Board& board) {
     return result;
 }
 
-array<bool, kCellCount> local_move_mask(const Board& board, int radius) {
-    array<bool, kCellCount> result{};
-    array<int, kCellCount> dist;
-    queue<int> q;
-    dist.fill(-1);
-
-    for (int id = 0; id < kCellCount; ++id) {
-        if (board.stone[id] != 0) {
-            dist[id] = 0;
-            q.push(id);
-        }
-    }
-
-    if (q.empty()) {
-        result.fill(true);
-        return result;
-    }
-
-    while (!q.empty()) {
-        const int id = q.front();
-        q.pop();
-        if (dist[id] == radius) continue;
-        for (int i = 0; i < neighbor_count[id]; ++i) {
-            const int nid = neighbors[id][i];
-            if (dist[nid] != -1) continue;
-            dist[nid] = dist[id] + 1;
-            q.push(nid);
-        }
-    }
-
-    for (int id = 0; id < kCellCount; ++id) {
-        result[id] = board.empty(id) && dist[id] > 0 && dist[id] <= radius;
-    }
-    return result;
-}
-
 
 int play_forced_pair(Board& board, vector<int>& empties, int& color, int first, int second) {
     if (!board.empty(first) || !board.empty(second)) return 0;
@@ -444,25 +408,6 @@ int play_edge_bridge_reply(Board& board, vector<int>& empties, int id, int place
         if (col == kSide - 2 && row > 0) {
             if (const int winner = play_forced_pair(board, empties, color, cell_id(row, kSide - 1), cell_id(row - 1, kSide - 1))) return winner;
         }
-    }
-    return 0;
-}
-
-int apply_existing_bridge_replies(Board& board, vector<int>& empties, int& color) {
-    for (int id = 0; id < kCellCount; ++id) {
-        const int placed_color = board.stone[id];
-        if (placed_color == 0) continue;
-
-        for (int i = 0; i < bridge_count[id]; ++i) {
-            const int far = bridge_far[id][i];
-            const int mid_a = bridge_mid_a[id][i];
-            const int mid_b = bridge_mid_b[id][i];
-            if (board.stone[far] == placed_color && board.empty(mid_a) && board.empty(mid_b)) {
-                if (const int winner = play_forced_pair(board, empties, color, mid_a, mid_b)) return winner;
-            }
-        }
-
-        if (const int winner = play_edge_bridge_reply(board, empties, id, placed_color, color)) return winner;
     }
     return 0;
 }

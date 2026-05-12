@@ -466,6 +466,7 @@ int choose_rollout_move(const Board& board, const vector<int>& empties, int colo
 
 int rollout(Board board, int color) {
     vector<int> empties = legal_moves(board);
+    if (const int winner = apply_existing_bridge_replies(board, empties, color)) return winner;
     int last_move = -1;
 
     while (!empties.empty()) {
@@ -521,16 +522,15 @@ vector<int> candidate_moves(const Board& board, int color) {
     PathInfo own_path = evaluate_paths(board, color);
     PathInfo opp_path = evaluate_paths(board, -color);
 
-    bool has_stone = false;
-    for (int id = 0; id < kCellCount; ++id) has_stone = has_stone || board.stone[id] != 0;
+    const int occupied = kCellCount - static_cast<int>(empties.size());
+    const int local_radius = occupied <= 6 ? 3 : 2;
+    const array<bool, kCellCount> local_mask = local_move_mask(board, local_radius);
 
     for (int id : empties) {
-        bool nearby = !has_stone;
-        for (int i = 0; i < near_count[id] && !nearby; ++i) nearby = board.stone[near_cells[id][i]] != 0;
         const int own_span = span_after_move(own_path, id);
         const int opp_span = span_after_move(opp_path, id);
         const bool corridor = own_span <= own_path.best + 1 || opp_span <= opp_path.best + 1;
-        if (!nearby && !corridor && empties.size() > 24) continue;
+        if (!local_mask[id] && !corridor && empties.size() > 24) continue;
 
         double score = static_move_score(board, id, color) + 0.72 * static_move_score(board, id, -color);
         if (own_span < kInf) score += 100.0 / (1.0 + own_span);

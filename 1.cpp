@@ -430,6 +430,26 @@ int play_forced_pair(Board& board, vector<int>& empties, int& color, int first, 
     return 0;
 }
 
+
+int play_forced_pair(Board& board, vector<int>& empties, int& color, int first, int second) {
+    if (!board.empty(first) || !board.empty(second)) return 0;
+    if (rng() & 1) swap(first, second);
+
+    auto erase_empty = [&](int cell) {
+        auto it = find(empties.begin(), empties.end(), cell);
+        if (it != empties.end()) empties.erase(it);
+    };
+
+    erase_empty(first);
+    if (board.play_id(first, color)) return color;
+    color = -color;
+
+    erase_empty(second);
+    if (board.play_id(second, color)) return color;
+    color = -color;
+    return 0;
+}
+
 int play_edge_bridge_reply(Board& board, vector<int>& empties, int id, int placed_color, int& color) {
     const int row = row_of(id);
     const int col = col_of(id);

@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <numeric>
 #include <queue>
@@ -29,13 +28,13 @@ constexpr int kBottom = 122;
 constexpr int kLeft = 123;
 constexpr int kRight = 124;
 constexpr int kDsuSize = 125;
+constexpr int kMaxNodes = 220000;
+constexpr int kPrepare = 256;
+constexpr int kLocalDis = 3;
 constexpr double kTimeLimitSeconds = 0.88;
-constexpr double kExplore = 0.55;
-constexpr int kRolloutRandomPercent = 7;
-constexpr int kNodeReserve = 180000;
-constexpr int kInf = 1000000000;
-constexpr int kStaticDepth = 2;
-constexpr int kStaticBranchLimit = 14;
+constexpr double kExploreSelf = 0.62;
+constexpr double kExploreOpp = 0.42;
+constexpr double kPriorCoef = 0.18;
 
 constexpr array<int, kCellCount> kThirdMoveBook = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -68,16 +67,9 @@ constexpr array<int, kCellCount> kFourthMoveBook = {
 const int kDr[6] = {-1, -1, 0, 0, 1, 1};
 const int kDc[6] = {0, 1, -1, 1, -1, 0};
 
-uint8_t row_of_id[kCellCount];
-uint8_t col_of_id[kCellCount];
-uint8_t neighbors[kCellCount][6];
-uint8_t neighbor_count[kCellCount];
-uint8_t near_cells[kCellCount][25];
-uint8_t near_count[kCellCount];
-uint8_t bridge_far[kCellCount][6];
-uint8_t bridge_mid_a[kCellCount][6];
-uint8_t bridge_mid_b[kCellCount][6];
-uint8_t bridge_count[kCellCount];
+uint8_t row_of_id[kCellCount], col_of_id[kCellCount];
+uint8_t neighbors[kCellCount][6], neighbor_count[kCellCount];
+uint8_t bridge_far[kCellCount][6], bridge_mid_a[kCellCount][6], bridge_mid_b[kCellCount][6], bridge_count[kCellCount];
 
 mt19937 rng([] {
     if (const char* seed_text = getenv("HEX_SEED")) {
@@ -93,41 +85,24 @@ chrono::steady_clock::time_point search_started_at;
 inline bool inside(int row, int col) {
     return static_cast<unsigned>(row) < kSide && static_cast<unsigned>(col) < kSide;
 }
-
 inline int cell_id(int row, int col) { return row * kSide + col; }
 inline int row_of(int id) { return row_of_id[id]; }
 inline int col_of(int id) { return col_of_id[id]; }
-
 inline bool time_left() {
     return chrono::duration<double>(chrono::steady_clock::now() - search_started_at).count() < kTimeLimitSeconds;
 }
 
 void init_geometry() {
     memset(neighbor_count, 0, sizeof(neighbor_count));
-    memset(near_count, 0, sizeof(near_count));
     memset(bridge_count, 0, sizeof(bridge_count));
-
     for (int id = 0; id < kCellCount; ++id) {
-        const int row = id / kSide;
-        const int col = id % kSide;
+        const int row = id / kSide, col = id % kSide;
         row_of_id[id] = static_cast<uint8_t>(row);
         col_of_id[id] = static_cast<uint8_t>(col);
-
         for (int dir = 0; dir < 6; ++dir) {
-            const int nr = row + kDr[dir];
-            const int nc = col + kDc[dir];
+            const int nr = row + kDr[dir], nc = col + kDc[dir];
             if (inside(nr, nc)) neighbors[id][neighbor_count[id]++] = static_cast<uint8_t>(cell_id(nr, nc));
         }
-
-        for (int dr = -2; dr <= 2; ++dr) {
-            for (int dc = -2; dc <= 2; ++dc) {
-                const int nr = row + dr;
-                const int nc = col + dc;
-                const int hex_dist = max({abs(dr), abs(dc), abs(dr + dc)});
-                if (inside(nr, nc) && hex_dist <= 2) near_cells[id][near_count[id]++] = static_cast<uint8_t>(cell_id(nr, nc));
-            }
-        }
-
         auto add_bridge = [&](int far_r, int far_c, int mid1_r, int mid1_c, int mid2_r, int mid2_c) {
             if (!inside(far_r, far_c) || !inside(mid1_r, mid1_c) || !inside(mid2_r, mid2_c)) return;
             const int idx = bridge_count[id]++;
@@ -135,7 +110,6 @@ void init_geometry() {
             bridge_mid_a[id][idx] = static_cast<uint8_t>(cell_id(mid1_r, mid1_c));
             bridge_mid_b[id][idx] = static_cast<uint8_t>(cell_id(mid2_r, mid2_c));
         };
-
         add_bridge(row - 2, col + 1, row - 1, col, row - 1, col + 1);
         add_bridge(row - 1, col - 1, row - 1, col, row, col - 1);
         add_bridge(row - 1, col + 2, row - 1, col + 1, row, col + 1);
@@ -151,13 +125,11 @@ struct Board {
     int turn = 1;
 
     Board() { reset(); }
-
     void reset() {
         stone.fill(0);
         iota(parent.begin(), parent.end(), 0);
         turn = 1;
     }
-
     int root(int value) {
         int result = value;
         while (parent[result] != result) result = parent[result];
@@ -168,30 +140,22 @@ struct Board {
         }
         return result;
     }
-
     void unite(int lhs, int rhs) {
         lhs = root(lhs);
         rhs = root(rhs);
         if (lhs != rhs) parent[lhs] = rhs;
     }
-
     bool empty(int id) const { return stone[id] == 0; }
     bool red_won() { return root(kTop) == root(kBottom); }
     bool blue_won() { return root(kLeft) == root(kRight); }
-    bool finished() { return red_won() || blue_won(); }
-
     bool play_id(int id, int color) {
-        assert(0 <= id && id < kCellCount);
-        assert(stone[id] == 0);
+        assert(0 <= id && id < kCellCount && stone[id] == 0);
         stone[id] = static_cast<int8_t>(color);
-        const int row = row_of(id);
-        const int col = col_of(id);
-
         for (int i = 0; i < neighbor_count[id]; ++i) {
             const int nid = neighbors[id][i];
             if (stone[nid] == color) unite(id, nid);
         }
-
+        const int row = row_of(id), col = col_of(id);
         if (color == 1) {
             if (row == 0) unite(id, kTop);
             if (row == kSide - 1) unite(id, kBottom);
@@ -199,126 +163,20 @@ struct Board {
             if (col == 0) unite(id, kLeft);
             if (col == kSide - 1) unite(id, kRight);
         }
-
         turn = -color;
         return color == 1 ? red_won() : blue_won();
     }
-
-    bool play_current(int row, int col) {
-        return play_id(cell_id(row, col), turn);
-    }
+    bool play_current(int row, int col) { return play_id(cell_id(row, col), turn); }
 };
 
-struct PathInfo {
-    array<int, kCellCount> from_start{};
-    array<int, kCellCount> from_goal{};
-    int best = kInf;
-};
-
-void path_distances(const Board& board, int color, bool reverse, array<int, kCellCount>& dist) {
-    deque<int> dq;
-    dist.fill(kInf);
-
+vector<int> legal_moves(const Board& board) {
+    vector<int> moves;
+    moves.reserve(kCellCount);
     for (int id = 0; id < kCellCount; ++id) {
-        if (board.stone[id] == -color) continue;
-        const int row = row_of(id);
-        const int col = col_of(id);
-        const bool on_edge = color == 1 ? (reverse ? row == kSide - 1 : row == 0)
-                                      : (reverse ? col == kSide - 1 : col == 0);
-        if (!on_edge) continue;
-        dist[id] = board.stone[id] == color ? 0 : 1;
-        if (dist[id] == 0) dq.push_front(id);
-        else dq.push_back(id);
+        if (board.empty(id)) moves.push_back(id);
     }
-
-    while (!dq.empty()) {
-        const int id = dq.front();
-        dq.pop_front();
-        for (int i = 0; i < neighbor_count[id]; ++i) {
-            const int nid = neighbors[id][i];
-            if (board.stone[nid] == -color) continue;
-            const int cost = board.stone[nid] == color ? 0 : 1;
-            if (dist[id] + cost < dist[nid]) {
-                dist[nid] = dist[id] + cost;
-                if (cost == 0) dq.push_front(nid);
-                else dq.push_back(nid);
-            }
-        }
-    }
+    return moves;
 }
-
-PathInfo evaluate_paths(const Board& board, int color) {
-    PathInfo info;
-    path_distances(board, color, false, info.from_start);
-    path_distances(board, color, true, info.from_goal);
-    for (int id = 0; id < kCellCount; ++id) {
-        if (board.stone[id] == -color) continue;
-        const int own_cost = board.stone[id] == color ? 0 : 1;
-        if (info.from_start[id] >= kInf || info.from_goal[id] >= kInf) continue;
-        info.best = min(info.best, info.from_start[id] + info.from_goal[id] - own_cost);
-    }
-    return info;
-}
-
-int span_after_move(const PathInfo& info, int id) {
-    if (info.from_start[id] >= kInf || info.from_goal[id] >= kInf) return kInf;
-    return info.from_start[id] + info.from_goal[id] - 1;
-}
-
-double edge_bridge_bonus(const Board& board, int id, int color) {
-    const int row = row_of(id);
-    const int col = col_of(id);
-    double bonus = 0.0;
-    auto add_if_virtual_bridge = [&](int anchor, int other_mid, int bridge_color) {
-        if (board.stone[anchor] == bridge_color && board.empty(other_mid)) {
-            bonus += bridge_color == color ? 28.0 : 18.0;
-        }
-    };
-
-    if (row == 0) {
-        if (col + 1 < kSide) add_if_virtual_bridge(cell_id(1, col), cell_id(0, col + 1), 1);
-        if (col > 0) add_if_virtual_bridge(cell_id(1, col - 1), cell_id(0, col - 1), 1);
-    }
-    if (row == kSide - 1) {
-        if (col > 0) add_if_virtual_bridge(cell_id(kSide - 2, col), cell_id(kSide - 1, col - 1), 1);
-        if (col + 1 < kSide) add_if_virtual_bridge(cell_id(kSide - 2, col + 1), cell_id(kSide - 1, col + 1), 1);
-    }
-    if (col == 0) {
-        if (row + 1 < kSide) add_if_virtual_bridge(cell_id(row, 1), cell_id(row + 1, 0), -1);
-        if (row > 0) add_if_virtual_bridge(cell_id(row - 1, 1), cell_id(row - 1, 0), -1);
-    }
-    if (col == kSide - 1) {
-        if (row > 0) add_if_virtual_bridge(cell_id(row, kSide - 2), cell_id(row - 1, kSide - 1), -1);
-        if (row + 1 < kSide) add_if_virtual_bridge(cell_id(row + 1, kSide - 2), cell_id(row + 1, kSide - 1), -1);
-    }
-    return bonus;
-}
-
-
-double static_move_score(const Board& board, int id, int color) {
-    const int row = row_of(id);
-    const int col = col_of(id);
-    double score = 12.0 - abs(row - kSide / 2) - abs(col - kSide / 2);
-
-    for (int i = 0; i < neighbor_count[id]; ++i) {
-        const int occupant = board.stone[neighbors[id][i]];
-        if (occupant == color) score += 30.0;
-        else if (occupant == -color) score += 18.0;
-    }
-
-    for (int i = 0; i < bridge_count[id]; ++i) {
-        const int far = bridge_far[id][i];
-        const int mid_a = bridge_mid_a[id][i];
-        const int mid_b = bridge_mid_b[id][i];
-        if (board.stone[far] == color && board.empty(mid_a) && board.empty(mid_b)) score += 58.0;
-        if (board.stone[far] == -color && board.empty(mid_a) && board.empty(mid_b)) score += 36.0;
-    }
-
-    score += color == 1 ? (5.0 - abs(row - 5)) * 6.0 : (5.0 - abs(col - 5)) * 6.0;
-    score += edge_bridge_bonus(board, id, color);
-    return score;
-}
-
 
 int stone_count(const Board& board) {
     int count = 0;
@@ -328,442 +186,261 @@ int stone_count(const Board& board) {
 
 int opening_book_move(const Board& board) {
     const int occupied = stone_count(board);
-    auto legal_book_move = [&](int id) {
-        return 0 <= id && id < kCellCount && board.empty(id) ? id : -1;
-    };
-
+    auto legal_book_move = [&](int id) { return 0 <= id && id < kCellCount && board.empty(id) ? id : -1; };
     if (occupied == 1) return legal_book_move(cell_id(7, 3));
 
-    const int swap_anchor = cell_id(1, 2);
-    const int reply_anchor = cell_id(7, 3);
+    const int swap_anchor = cell_id(1, 2), reply_anchor = cell_id(7, 3);
     if ((occupied == 2 && board.stone[swap_anchor] != 0) ||
         (occupied == 3 && board.stone[swap_anchor] != 0 && board.stone[reply_anchor] != 0)) {
         int pattern_id = -1;
         for (int id = 0; id < kCellCount; ++id) {
-            if (board.stone[id] == 0) continue;
-            if (id == swap_anchor) continue;
-            if (occupied == 3 && id == reply_anchor) continue;
+            if (board.stone[id] == 0 || id == swap_anchor || (occupied == 3 && id == reply_anchor)) continue;
             pattern_id = id;
         }
         if (pattern_id != -1) {
-            const int action = occupied == 2 ? kThirdMoveBook[pattern_id] : kFourthMoveBook[pattern_id];
-            return legal_book_move(action);
+            return legal_book_move(occupied == 2 ? kThirdMoveBook[pattern_id] : kFourthMoveBook[pattern_id]);
         }
     }
-
     return -1;
 }
 
-int immediate_win(const Board& board, const vector<int>& empties, int color) {
-    for (int id : empties) {
+int immediate_win(const Board& board, const vector<int>& moves, int color) {
+    for (int id : moves) {
         Board trial = board;
         if (trial.play_id(id, color)) return id;
     }
     return -1;
 }
 
-vector<int> legal_moves(const Board& board) {
-    vector<int> result;
-    result.reserve(kCellCount);
+double shape_score(const Board& board, int id, int color) {
+    const int row = row_of(id), col = col_of(id);
+    double score = 10.0 - abs(row - 5) - abs(col - 5);
+    score += color == 1 ? (5.0 - abs(row - 5)) * 4.0 : (5.0 - abs(col - 5)) * 4.0;
+    for (int i = 0; i < neighbor_count[id]; ++i) {
+        const int s = board.stone[neighbors[id][i]];
+        if (s == color) score += 24.0;
+        if (s == -color) score += 14.0;
+    }
+    for (int i = 0; i < bridge_count[id]; ++i) {
+        const int far = bridge_far[id][i], a = bridge_mid_a[id][i], b = bridge_mid_b[id][i];
+        if (board.stone[far] == color && board.empty(a) && board.empty(b)) score += 40.0;
+        if (board.stone[far] == -color && board.empty(a) && board.empty(b)) score += 28.0;
+    }
+    return score;
+}
+
+array<bool, kCellCount> root_ban_mask(const Board& board) {
+    array<bool, kCellCount> banned{};
+    array<int, kCellCount> dis;
+    queue<int> q;
+    dis.fill(-1);
     for (int id = 0; id < kCellCount; ++id) {
-        if (board.empty(id)) result.push_back(id);
-    }
-    return result;
-}
-
-
-int play_forced_pair(Board& board, vector<int>& empties, int& color, int first, int second) {
-    if (!board.empty(first) || !board.empty(second)) return 0;
-    if (rng() & 1) swap(first, second);
-
-    auto erase_empty = [&](int cell) {
-        auto it = find(empties.begin(), empties.end(), cell);
-        if (it != empties.end()) empties.erase(it);
-    };
-
-    erase_empty(first);
-    if (board.play_id(first, color)) return color;
-    color = -color;
-
-    erase_empty(second);
-    if (board.play_id(second, color)) return color;
-    color = -color;
-    return 0;
-}
-
-int play_edge_bridge_reply(Board& board, vector<int>& empties, int id, int placed_color, int& color) {
-    const int row = row_of(id);
-    const int col = col_of(id);
-    if (placed_color == 1) {
-        if (row == 1 && col + 1 < kSide) {
-            if (const int winner = play_forced_pair(board, empties, color, cell_id(0, col), cell_id(0, col + 1))) return winner;
-        }
-        if (row == kSide - 2 && col > 0) {
-            if (const int winner = play_forced_pair(board, empties, color, cell_id(kSide - 1, col - 1), cell_id(kSide - 1, col))) return winner;
-        }
-    } else {
-        if (col == 1 && row + 1 < kSide) {
-            if (const int winner = play_forced_pair(board, empties, color, cell_id(row, 0), cell_id(row + 1, 0))) return winner;
-        }
-        if (col == kSide - 2 && row > 0) {
-            if (const int winner = play_forced_pair(board, empties, color, cell_id(row, kSide - 1), cell_id(row - 1, kSide - 1))) return winner;
+        if (board.stone[id] != 0) {
+            dis[id] = 0;
+            q.push(id);
         }
     }
-    return 0;
-}
-
-int choose_rollout_move(const Board& board, const vector<int>& empties, int color, int last_move) {
-    const int win = immediate_win(board, empties, color);
-    if (win != -1) return win;
-    const int block = immediate_win(board, empties, -color);
-    if (block != -1) return block;
-
-    vector<int> candidates;
-    array<bool, kCellCount> used{};
-    auto push = [&](int id) {
-        if (id >= 0 && id < kCellCount && board.empty(id) && !used[id]) {
-            used[id] = true;
-            candidates.push_back(id);
-        }
-    };
-
-    if (last_move != -1) {
-        for (int i = 0; i < near_count[last_move]; ++i) push(near_cells[last_move][i]);
-    }
-    for (int id : empties) {
+    if (q.empty()) return banned;
+    while (!q.empty()) {
+        const int id = q.front();
+        q.pop();
+        if (dis[id] == kLocalDis) continue;
         for (int i = 0; i < neighbor_count[id]; ++i) {
-            if (board.stone[neighbors[id][i]] != 0) {
-                push(id);
-                break;
+            const int nid = neighbors[id][i];
+            if (dis[nid] == -1) {
+                dis[nid] = dis[id] + 1;
+                q.push(nid);
             }
         }
     }
-    if (candidates.empty()) candidates = empties;
-
-    if (empties.size() > 18 && static_cast<int>(rng() % 100) < kRolloutRandomPercent) {
-        return candidates[rng() % candidates.size()];
-    }
-
-    const PathInfo own_path = evaluate_paths(board, color);
-    const PathInfo opp_path = evaluate_paths(board, -color);
-    int best = candidates[0];
-    double best_score = -1e100;
-    for (int id : candidates) {
-        double score = static_move_score(board, id, color) + 0.60 * static_move_score(board, id, -color);
-        const int own_span = span_after_move(own_path, id);
-        const int opp_span = span_after_move(opp_path, id);
-        if (own_span < kInf) score += 80.0 / (1.0 + own_span);
-        if (opp_span < kInf) score += 64.0 / (1.0 + opp_span);
-        if (own_span == own_path.best) score += 55.0;
-        if (opp_span == opp_path.best) score += 45.0;
-        if (score > best_score) {
-            best_score = score;
-            best = id;
-        }
-    }
-    return best;
+    for (int id = 0; id < kCellCount; ++id) banned[id] = board.empty(id) && dis[id] > kLocalDis;
+    return banned;
 }
 
-int rollout(Board board, int color) {
-    vector<int> empties = legal_moves(board);
-    if (const int winner = apply_existing_bridge_replies(board, empties, color)) return winner;
-    int last_move = -1;
+struct RandomVisit {
+    array<int, kCellCount> seq{};
+    array<int, kCellCount> pos{};
+    int n = 0;
 
-    while (!empties.empty()) {
-        const int id = choose_rollout_move(board, empties, color, last_move);
-        empties.erase(find(empties.begin(), empties.end(), id));
-        if (board.play_id(id, color)) return color;
-        last_move = id;
-
-        const int placed_color = color;
-        color = -color;
-
-        bool bridge_replied = false;
-        for (int i = 0; i < bridge_count[id]; ++i) {
-            const int far = bridge_far[id][i];
-            const int mid_a = bridge_mid_a[id][i];
-            const int mid_b = bridge_mid_b[id][i];
-            if (board.stone[far] == placed_color && board.empty(mid_a) && board.empty(mid_b)) {
-                if (const int winner = play_forced_pair(board, empties, color, mid_a, mid_b)) return winner;
-                bridge_replied = true;
-                break;
-            }
-        }
-        if (!bridge_replied) {
-            if (const int winner = play_edge_bridge_reply(board, empties, id, placed_color, color)) return winner;
-        }
+    void init(const vector<int>& moves) {
+        n = static_cast<int>(moves.size());
+        for (int i = 0; i < n; ++i) seq[i] = moves[i];
+        shuffle(seq.begin(), seq.begin() + n, rng);
+        for (int i = 0; i < n; ++i) pos[seq[i]] = i;
     }
-    return board.red_won() ? 1 : -1;
-}
+    void erase(int move) {
+        const int at = pos[move];
+        const int last = seq[n - 1];
+        seq[at] = last;
+        pos[last] = at;
+        --n;
+    }
+    vector<int> remaining() const {
+        return vector<int>(seq.begin(), seq.begin() + n);
+    }
+};
 
 struct Node {
-    int move = -1;
-    int player = 0;
-    int parent = -1;
-    vector<int> children;
-    vector<int> untried;
+    array<int, kCellCount> child{};
     int visits = 0;
-    double wins = 0.0;
-    double prior = 0.0;
+    int wins = 0;
+    int sons = 0;
 };
 
 vector<Node> tree;
+array<double, kCellCount> prior{};
+array<bool, kCellCount> banned_root{};
 int root_color = 1;
 
-vector<int> candidate_moves(const Board& board, int color) {
-    vector<int> empties = legal_moves(board);
-    const int win = immediate_win(board, empties, color);
-    if (win != -1) return {win};
-    const int block = immediate_win(board, empties, -color);
-    if (block != -1) return {block};
-
-    array<bool, kCellCount> used{};
-    vector<pair<double, int>> scored;
-    PathInfo own_path = evaluate_paths(board, color);
-    PathInfo opp_path = evaluate_paths(board, -color);
-
-    const int occupied = kCellCount - static_cast<int>(empties.size());
-    const int local_radius = occupied <= 6 ? 3 : 2;
-    const array<bool, kCellCount> local_mask = local_move_mask(board, local_radius);
-
-    for (int id : empties) {
-        const int own_span = span_after_move(own_path, id);
-        const int opp_span = span_after_move(opp_path, id);
-        const bool corridor = own_span <= own_path.best + 1 || opp_span <= opp_path.best + 1;
-        if (!local_mask[id] && !corridor && empties.size() > 24) continue;
-
-        double score = static_move_score(board, id, color) + 0.72 * static_move_score(board, id, -color);
-        if (own_span < kInf) score += 100.0 / (1.0 + own_span);
-        if (opp_span < kInf) score += 85.0 / (1.0 + opp_span);
-        if (own_span == own_path.best) score += 80.0;
-        if (opp_span == opp_path.best) score += 64.0;
-        scored.push_back({score, id});
-        used[id] = true;
-    }
-
-    if (scored.empty()) {
-        for (int id : empties) scored.push_back({static_move_score(board, id, color), id});
-    }
-
-    sort(scored.begin(), scored.end(), greater<pair<double, int>>());
-    const int keep = empties.size() > 80 ? 14 : empties.size() > 55 ? 22 : empties.size() > 30 ? 34 : kCellCount;
-    vector<int> result;
-    for (int i = 0; i < static_cast<int>(scored.size()) && i < keep; ++i) result.push_back(scored[i].second);
-    shuffle(result.begin(), result.end(), rng);
-    return result;
-}
-
-double position_score(const Board& board, int perspective) {
-    Board terminal_check = board;
-    if (terminal_check.red_won()) return perspective == 1 ? 1e6 : -1e6;
-    if (terminal_check.blue_won()) return perspective == -1 ? 1e6 : -1e6;
-
-    const PathInfo own_path = evaluate_paths(board, perspective);
-    const PathInfo opp_path = evaluate_paths(board, -perspective);
-    int own_mobility = 0;
-    int opp_mobility = 0;
-    double local_shape = 0.0;
-
-    for (int id = 0; id < kCellCount; ++id) {
-        if (!board.empty(id)) continue;
-        if (span_after_move(own_path, id) == own_path.best) ++own_mobility;
-        if (span_after_move(opp_path, id) == opp_path.best) ++opp_mobility;
-        local_shape += 0.010 * static_move_score(board, id, perspective);
-        local_shape -= 0.008 * static_move_score(board, id, -perspective);
-    }
-
-    return 120.0 * (opp_path.best - own_path.best) + 3.5 * (own_mobility - opp_mobility) + local_shape;
-}
-
-vector<int> ordered_static_moves(const Board& board, int color, int limit) {
-    vector<int> empties = legal_moves(board);
-    const int win = immediate_win(board, empties, color);
-    if (win != -1) return {win};
-    const int block = immediate_win(board, empties, -color);
-    if (block != -1) return {block};
-
-    const PathInfo own_path = evaluate_paths(board, color);
-    const PathInfo opp_path = evaluate_paths(board, -color);
-    vector<pair<double, int>> scored;
-    scored.reserve(empties.size());
-    for (int id : empties) {
-        const int own_span = span_after_move(own_path, id);
-        const int opp_span = span_after_move(opp_path, id);
-        double score = static_move_score(board, id, color) + 0.80 * static_move_score(board, id, -color);
-        if (own_span < kInf) score += 120.0 / (1.0 + own_span);
-        if (opp_span < kInf) score += 110.0 / (1.0 + opp_span);
-        if (own_span == own_path.best) score += 95.0;
-        if (opp_span == opp_path.best) score += 90.0;
-        scored.push_back({score, id});
-    }
-    sort(scored.begin(), scored.end(), greater<pair<double, int>>());
-
-    vector<int> result;
-    const int keep = min(limit, static_cast<int>(scored.size()));
-    result.reserve(keep);
-    for (int i = 0; i < keep; ++i) result.push_back(scored[i].second);
-    return result;
-}
-
-double static_minimax(const Board& board, int color, int perspective, int depth, double alpha, double beta) {
-    Board terminal_check = board;
-    if (depth == 0 || terminal_check.finished()) return position_score(board, perspective);
-
-    const vector<int> moves = ordered_static_moves(board, color, kStaticBranchLimit);
-    if (moves.empty()) return position_score(board, perspective);
-
-    if (color == perspective) {
-        double best = -1e100;
-        for (int id : moves) {
-            Board child = board;
-            const bool won = child.play_id(id, color);
-            const double value = won ? 1e6 : static_minimax(child, -color, perspective, depth - 1, alpha, beta);
-            best = max(best, value);
-            alpha = max(alpha, best);
-            if (alpha >= beta) break;
-        }
-        return best;
-    }
-
-    double best = 1e100;
-    for (int id : moves) {
-        Board child = board;
-        const bool won = child.play_id(id, color);
-        const double value = won ? -1e6 : static_minimax(child, -color, perspective, depth - 1, alpha, beta);
-        best = min(best, value);
-        beta = min(beta, best);
-        if (alpha >= beta) break;
-    }
-    return best;
-}
-
-int static_search_move(const Board& board) {
-    const vector<int> moves = ordered_static_moves(board, board.turn, kStaticBranchLimit);
-    if (moves.empty()) return -1;
-
-    int best_move = moves.front();
-    double best_score = -1e100;
-    for (int id : moves) {
-        Board child = board;
-        const bool won = child.play_id(id, board.turn);
-        const double score = won ? 1e6 : static_minimax(child, -board.turn, board.turn, kStaticDepth - 1, -1e100, 1e100);
-        if (score > best_score) {
-            best_score = score;
-            best_move = id;
-        }
-    }
-    return best_move;
-}
-
-int make_node(int move, int player, int parent, const Board& board, int next_color) {
-    Node node;
-    node.move = move;
-    node.player = player;
-    node.parent = parent;
-    if (move != -1) node.prior = min(1.0, max(0.0, (static_move_score(board, move, player) + 50.0) / 260.0));
-    node.untried = candidate_moves(board, next_color);
-    tree.push_back(std::move(node));
+int new_node() {
+    tree.emplace_back();
     return static_cast<int>(tree.size()) - 1;
 }
 
-int select_child(int node_id) {
-    const Node& node = tree[node_id];
-    int best = node.children.front();
-    double best_score = -1e100;
-    const double parent_log = log(node.visits + 1.0);
-    for (int child_id : node.children) {
-        const Node& child = tree[child_id];
-        const double visits = child.visits + 1e-9;
-        const double value = child.wins / visits;
-        const double ucb = value + kExplore * sqrt(parent_log / visits) + 1.8 * child.prior / (child.visits + 1.0);
-        if (ucb > best_score) {
-            best_score = ucb;
-            best = child_id;
-        }
-    }
-    return best;
-}
-
-pair<int, int> search(Board root_board) {
-    vector<int> root_legal = legal_moves(root_board);
-    int move = immediate_win(root_board, root_legal, root_board.turn);
-    if (move != -1) return {row_of(move), col_of(move)};
-    move = immediate_win(root_board, root_legal, -root_board.turn);
-    if (move != -1) return {row_of(move), col_of(move)};
-    const int static_fallback = static_search_move(root_board);
-    if (!time_left() && static_fallback != -1) return {row_of(static_fallback), col_of(static_fallback)};
-
-    root_color = root_board.turn;
-    tree.clear();
-    tree.reserve(kNodeReserve);
-    make_node(-1, -root_color, -1, root_board, root_color);
-
-    int iterations = 0;
-    while (time_left() && static_cast<int>(tree.size()) < kNodeReserve - 2) {
-        Board board = root_board;
-        int node_id = 0;
-        int color = root_color;
-
-        while (tree[node_id].untried.empty() && !tree[node_id].children.empty()) {
-            node_id = select_child(node_id);
-            if (board.play_id(tree[node_id].move, tree[node_id].player)) break;
-            color = -tree[node_id].player;
-        }
-
-        int winner = 0;
-        if (tree[node_id].move != -1) {
-            if (tree[node_id].player == 1 && board.red_won()) winner = 1;
-            if (tree[node_id].player == -1 && board.blue_won()) winner = -1;
-        }
-
-        if (winner == 0 && !tree[node_id].untried.empty()) {
-            int idx = rng() % tree[node_id].untried.size();
-            if (node_id == 0 && static_fallback != -1) {
-                for (int i = 0; i < static_cast<int>(tree[node_id].untried.size()); ++i) {
-                    if (tree[node_id].untried[i] == static_fallback) {
-                        idx = i;
-                        break;
+void build_prior(const Board& root, const vector<int>& root_moves) {
+    array<int, kCellCount> warm{};
+    vector<int> moves = root_moves;
+    const int prepare = min(kPrepare, max(48, 3 * static_cast<int>(moves.size())));
+    for (int t = 0; t < prepare; ++t) {
+        shuffle(moves.begin(), moves.end(), rng);
+        Board board = root;
+        int color = root.turn;
+        vector<pair<int, int>> played;
+        for (int id : moves) {
+            played.push_back({id, color});
+            if (board.play_id(id, color)) {
+                if (color == root.turn) {
+                    for (const auto& item : played) {
+                        if (item.second == root.turn) ++warm[item.first];
                     }
                 }
+                break;
             }
-            const int next_move = tree[node_id].untried[idx];
-            tree[node_id].untried[idx] = tree[node_id].untried.back();
-            tree[node_id].untried.pop_back();
-            winner = board.play_id(next_move, color) ? color : 0;
-            const int child_id = make_node(next_move, color, node_id, board, -color);
-            tree[node_id].children.push_back(child_id);
-            node_id = child_id;
             color = -color;
         }
+    }
+    prior.fill(0.0);
+    for (int id : root_moves) {
+        const double warm_score = static_cast<double>(warm[id]) / max(1, prepare);
+        const double static_score = max(0.0, shape_score(root, id, root.turn)) / 180.0;
+        prior[id] = kPriorCoef * warm_score + 0.04 * static_score;
+    }
+}
 
-        if (winner == 0) winner = rollout(board, color);
+int tactical_move(const Board& board, const RandomVisit& can, int color) {
+    const vector<int> moves = can.remaining();
+    int id = immediate_win(board, moves, color);
+    if (id != -1) return id;
+    id = immediate_win(board, moves, -color);
+    return id;
+}
 
-        for (int cur = node_id; cur != -1; cur = tree[cur].parent) {
-            ++tree[cur].visits;
-            if (winner == root_color) tree[cur].wins += 1.0;
-            else tree[cur].wins -= 0.5;
+double ucb_value(int parent, int son, int move, int depth) {
+    const double rate = static_cast<double>(tree[son].wins) / tree[son].visits;
+    const double exploit = (depth & 1) ? 1.0 - rate : rate;
+    const double explore = ((depth & 1) ? kExploreOpp : kExploreSelf) * sqrt(log(tree[parent].visits + 1.0) / tree[son].visits);
+    return exploit + explore + prior[move];
+}
+
+int pick_tree_move(int node, const RandomVisit& can, int depth, bool playout) {
+    if (playout) return can.seq[rng() % can.n];
+
+    if (tree[node].sons < can.n) {
+        for (int i = 0; i < can.n; ++i) {
+            const int move = can.seq[i];
+            if (!tree[node].child[move] && (depth != 0 || !banned_root[move])) return move;
         }
-
-        if ((++iterations & 63) == 0 && !time_left()) break;
+        for (int i = 0; i < can.n; ++i) {
+            const int move = can.seq[i];
+            if (!tree[node].child[move]) return move;
+        }
     }
 
-    int best_child = -1;
-    int best_visits = -1;
-    double best_rate = -1e100;
-    for (int child_id : tree[0].children) {
-        const Node& child = tree[child_id];
-        const double rate = child.visits > 0 ? child.wins / child.visits : -1e100;
-        if (child.visits > best_visits || (child.visits == best_visits && rate > best_rate)) {
-            best_visits = child.visits;
+    int best = can.seq[0];
+    double best_value = -1e100;
+    for (int i = 0; i < can.n; ++i) {
+        const int move = can.seq[i];
+        if (depth == 0 && banned_root[move]) continue;
+        const int son = tree[node].child[move];
+        if (!son) continue;
+        const double value = ucb_value(node, son, move, depth);
+        if (value > best_value) {
+            best_value = value;
+            best = move;
+        }
+    }
+    return best_value > -1e90 ? best : can.seq[rng() % can.n];
+}
+
+pair<int, int> search(Board root) {
+    vector<int> root_moves = legal_moves(root);
+    int move = immediate_win(root, root_moves, root.turn);
+    if (move != -1) return {row_of(move), col_of(move)};
+    move = immediate_win(root, root_moves, -root.turn);
+    if (move != -1) return {row_of(move), col_of(move)};
+
+    root_color = root.turn;
+    banned_root = root_ban_mask(root);
+    build_prior(root, root_moves);
+    tree.clear();
+    tree.reserve(kMaxNodes);
+    new_node();
+
+    array<int, kCellCount + 1> path{};
+    int iterations = 0;
+    while (time_left() && static_cast<int>(tree.size()) < kMaxNodes - 2) {
+        Board board = root;
+        RandomVisit can;
+        can.init(root_moves);
+        int node = 0, color = root_color, depth = 0, top = 0, winner = 0;
+        bool playout = false;
+        path[top++] = node;
+
+        while (can.n > 0) {
+            int chosen = tactical_move(board, can, color);
+            if (chosen == -1) chosen = pick_tree_move(node, can, depth, playout);
+
+            if (!playout && !tree[node].child[chosen]) {
+                tree[node].child[chosen] = new_node();
+                ++tree[node].sons;
+                playout = true;
+            }
+            if (!playout || tree[node].child[chosen]) {
+                node = tree[node].child[chosen];
+                path[top++] = node;
+            }
+            can.erase(chosen);
+            if (board.play_id(chosen, color)) {
+                winner = color;
+                break;
+            }
+            color = -color;
+            ++depth;
+        }
+        if (winner == 0) winner = board.red_won() ? 1 : -1;
+
+        for (int i = 0; i < top; ++i) {
+            ++tree[path[i]].visits;
+            if (winner == root_color) ++tree[path[i]].wins;
+        }
+        if ((++iterations & 255) == 0 && !time_left()) break;
+    }
+
+    int answer = root_moves.front();
+    double best_rate = -1.0;
+    bool found_unbanned = false;
+    for (int id : root_moves) {
+        const int child = tree[0].child[id];
+        if (!child || tree[child].visits <= 1) continue;
+        const double rate = static_cast<double>(tree[child].wins) / tree[child].visits;
+        const bool usable = !banned_root[id];
+        if ((usable && !found_unbanned) || (usable == found_unbanned && rate > best_rate)) {
+            answer = id;
             best_rate = rate;
-            best_child = child_id;
+            found_unbanned = usable;
         }
     }
-
-    if (best_child != -1) return {row_of(tree[best_child].move), col_of(tree[best_child].move)};
-    if (static_fallback != -1) return {row_of(static_fallback), col_of(static_fallback)};
-    if (!root_legal.empty()) return {row_of(root_legal.front()), col_of(root_legal.front())};
-    return {0, 0};
+    return {row_of(answer), col_of(answer)};
 }
 
 Json::Value make_response(int row, int col) {
@@ -790,9 +467,7 @@ int main() {
     Json::Value input_json;
     string errors;
     unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
-    if (!reader->parse(payload.data(), payload.data() + payload.size(), &input_json, &errors)) {
-        return 0;
-    }
+    if (!reader->parse(payload.data(), payload.data() + payload.size(), &input_json, &errors)) return 0;
 
     Board board;
     const int finished_turns = input_json["responses"].size();
@@ -817,9 +492,9 @@ int main() {
 
     pair<int, int> decision;
     if (forced_start) {
-        decision = make_pair(1, 2);
+        decision = {1, 2};
     } else if (const int book_move = opening_book_move(board); book_move != -1) {
-        decision = make_pair(row_of(book_move), col_of(book_move));
+        decision = {row_of(book_move), col_of(book_move)};
     } else {
         decision = search(board);
     }
